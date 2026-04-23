@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from hopewell import attestation as att_mod
 from hopewell import config as config_mod
-from hopewell import events, paths, storage
+from hopewell import events, meta as meta_mod, paths, storage
 from hopewell.attestation import AgentRegistry
 from hopewell.config import ProjectConfig
 from hopewell.model import (
@@ -52,6 +52,19 @@ class Project:
         reg = default_registry()
         # Filter registry to enabled components (keeps validation useful without
         # rejecting built-ins a project chose not to enable).
+
+        # v0.5.2: cross-version compatibility gate.
+        #   - If meta.json is missing (legacy .hopewell/), auto-heal by writing
+        #     a current-version stamp. Pre-0.5.2 projects stayed on schema 1,
+        #     so auto-filling with SCHEMA_VERSION="1" is correct.
+        #   - If meta.json is present, check_compatibility raises on mismatch.
+        #   - minimum_version from config is enforced regardless.
+        hw = paths.hw_dir(root)
+        mf = meta_mod.load(hw)
+        if mf is None and hw.is_dir():
+            mf = meta_mod.write_for_init(hw)
+        meta_mod.check_compatibility(mf, minimum_version=cfg.coordination.minimum_version)
+
         return cls(root, cfg, reg)
 
     @classmethod
@@ -110,6 +123,12 @@ class Project:
         # Git merge driver + .gitattributes for JSONL append-only logs (v0.5).
         # Best-effort: only activates in a git worktree. Idempotent.
         _install_merge_driver(root)
+
+        # Write or refresh meta.json — the version contract (v0.5.2).
+        if already_initialized:
+            meta_mod.write_for_migrate(hw)
+        else:
+            meta_mod.write_for_init(hw)
 
         return cls.load(root)
 

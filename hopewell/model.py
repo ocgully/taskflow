@@ -263,6 +263,10 @@ class Node:
     component_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     body: str = ""                                     # free-form markdown body (not notes)
     notes: List[str] = field(default_factory=list)     # append-only
+    # v0.5.2: preserve unknown front-matter fields across round-trips so that
+    # an older Hopewell editing a newer-format node doesn't silently drop
+    # fields it doesn't understand.
+    extras: Dict[str, Any] = field(default_factory=dict)
 
     # ---- status transitions ----
     def can_transition_to(self, new_status: NodeStatus) -> bool:
@@ -284,6 +288,15 @@ class Node:
         return bool(set(names) & set(self.components))
 
     # ---- serialisation ----
+    # Fields we know how to round-trip. Anything ELSE in the front-matter is
+    # preserved as-is via `extras` so older Hopewells don't destroy newer data.
+    KNOWN_FIELDS = {
+        "id", "status", "priority", "created", "updated",
+        "owner", "project", "parent", "components",
+        "inputs", "outputs", "blocks", "blocked_by", "related",
+        "component_data",
+    }
+
     def to_frontmatter(self) -> Dict[str, Any]:
         """Convert to the dict we'll serialise into YAML front-matter."""
         d: Dict[str, Any] = {
@@ -313,10 +326,15 @@ class Node:
             d["related"] = list(self.related)
         if self.component_data:
             d["component_data"] = self.component_data
+        # Preserve any fields a newer Hopewell wrote that we don't recognise.
+        for k, v in self.extras.items():
+            if k not in d:
+                d[k] = v
         return d
 
     @classmethod
     def from_frontmatter(cls, fm: Dict[str, Any], *, title: str, body: str, notes: List[str]) -> "Node":
+        extras = {k: v for k, v in fm.items() if k not in cls.KNOWN_FIELDS}
         return cls(
             id=fm["id"],
             title=title,
@@ -336,6 +354,7 @@ class Node:
             component_data=dict(fm.get("component_data", {})),
             body=body,
             notes=notes,
+            extras=extras,
         )
 
 

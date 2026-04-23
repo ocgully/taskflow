@@ -33,6 +33,9 @@ class CoordinationConfig:
     mode: str = "auto"
     base_branch: str = "main"
     stale_claim_days: int = 14
+    # v0.5.2: repo-level minimum Hopewell version floor. None = no enforcement.
+    # A load below this version refuses with a typed error + upgrade hint.
+    minimum_version: Optional[str] = None
 
 
 @dataclass
@@ -96,6 +99,10 @@ class ProjectConfig:
             f'base_branch = "{self.coordination.base_branch}"',
             f'stale_claim_days = {self.coordination.stale_claim_days}',
         ]
+        if self.coordination.minimum_version:
+            lines.append(f'minimum_version = "{self.coordination.minimum_version}"')
+        else:
+            lines.append('# minimum_version = "0.5.2"    # uncomment to pin a floor')
         return "\n".join(lines) + "\n"
 
 
@@ -143,6 +150,7 @@ def _from_dict(d: Dict[str, Any]) -> ProjectConfig:
             mode=coord.get("mode", "auto"),
             base_branch=coord.get("base_branch", "main"),
             stale_claim_days=int(coord.get("stale_claim_days", 14)),
+            minimum_version=coord.get("minimum_version") or None,
         ),
     )
     if not cfg.enabled_components:

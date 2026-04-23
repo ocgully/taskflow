@@ -798,3 +798,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nhopewell: interrupted", file=sys.stderr)
         return 130
+    except Exception as e:
+        # Version-contract errors surface with a clean message (no traceback).
+        from hopewell.meta import HopewellVersionError
+        if isinstance(e, HopewellVersionError):
+            print(f"hopewell: {e}", file=sys.stderr)
+            return 3
+        raise

@@ -82,6 +82,75 @@ hopewell close HW-0001 --commit abc123 --reason "tests pass, shipped"
 hopewell hooks install
 ```
 
+## Version compatibility — multiple agents on different Hopewell versions
+
+Hopewell is a local package, so in a multi-agent / multi-machine setup
+nothing guarantees every agent is on the same version. Three mechanisms
+keep version-skew from silently corrupting data.
+
+### 1. `.hopewell/meta.json` — the version contract
+
+Every project has one, written at `init` and refreshed at `migrate`:
+
+```json
+{
+  "hopewell_schema": "1",
+  "hopewell_version_last_setup": "0.5.2",
+  "created_at": "…",
+  "last_migrated_at": "…"
+}
+```
+
+On every `Project.load()`:
+- If `hopewell_schema` > the running package's schema → **refuse**
+  with `"this .hopewell/ uses schema N, but this Hopewell understands up
+  to schema M. Upgrade via `pip install -U hopewell` and retry."`
+- If `hopewell_schema` < the running package's schema → **refuse** with
+  `"run `hopewell migrate` to upgrade the project files."`
+- If schemas match → proceed.
+
+Pre-`0.5.2` `.hopewell/` trees don't have a `meta.json`. They auto-heal
+on first load by writing one with the current schema (safe: every
+Hopewell ≤ 0.5.2 stayed on schema 1).
+
+### 2. `[coordination] minimum_version` — the floor
+
+Repos can pin a minimum Hopewell version in `.hopewell/config.toml`:
+
+```toml
+[coordination]
+minimum_version = "0.5.2"
+```
+
+Any Hopewell below that floor refuses to act with:
+`"this project pins minimum_version = '0.5.2' but this Hopewell is
+v0.5.0. Run `pip install -U hopewell>=0.5.2` and retry."`
+
+Use this when the team has committed to a feature set available
+only in a newer version — prevents an out-of-date agent from writing
+data the team can't consume.
+
+### 3. Preserve-unknown round-trip
+
+When an older Hopewell reads a node file written by a newer version,
+fields it doesn't recognise are captured into a private `extras` dict
+and re-emitted verbatim on save. An older agent editing a newer-format
+node loses nothing.
+
+Same principle for event-log JSONL records — unknown fields pass
+through untouched.
+
+### Policy
+
+- **Breaking changes bump the schema version.** Schema bumps are rare
+  and always ship alongside an upgrade path in `hopewell migrate`.
+- **Most releases are additive** — v0.1 through v0.5.2 all stayed on
+  schema 1 because every change was forward-compatible.
+- **Pin your team.** Add `minimum_version` to `config.toml` when you
+  adopt a feature that matters to the team; add `hopewell>=X.Y.Z`
+  to CI's lockfile. Informal version drift between team members is
+  where most pain comes from.
+
 ## Upgrading — `hopewell migrate`
 
 After upgrading the `hopewell` package (new version brings new
