@@ -80,4 +80,10 @@ EVENT_KINDS = {
     "orch.run.node.finish",
     "orch.run.finish",
     "orch.run.fail",
+    # HW-0028 — flow runtime
+    "flow.push",
+    "flow.ack",
+    "flow.leave",
+    "flow.enter",
+    "orch.run.flow.dispatch",
 }

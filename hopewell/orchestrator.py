@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from hopewell import events
+from hopewell import flow as flow_mod
 from hopewell.model import Node, NodeStatus
 from hopewell.project import Project
 from hopewell.scheduler import Plan, Scheduler
@@ -251,6 +252,29 @@ class Runner:
             # After each wave, re-plan — if a node finished out of order and
             # unblocked downstream work, that work appears in the next plan.
 
+        # ------------------------------------------------------------------
+        # HW-0028: flow-inbox drain (second pass, additive to blocks-DAG run).
+        # ------------------------------------------------------------------
+        if not dry_run:
+            flow_result = self._drain_flow_inboxes(run_id=run_id, actor=actor)
+            # Fold flow-dispatched nodes into the main counters so the run
+            # summary reflects the full picture.
+            for nid in flow_result.get("succeeded", []):
+                if nid not in nodes_succeeded:
+                    nodes_succeeded.append(nid)
+                if nid not in nodes_run:
+                    nodes_run.append(nid)
+            for nid in flow_result.get("failed", []):
+                if nid not in nodes_failed:
+                    nodes_failed.append(nid)
+                if nid not in nodes_run:
+                    nodes_run.append(nid)
+            for nid in flow_result.get("skipped", []):
+                if nid not in nodes_skipped:
+                    nodes_skipped.append(nid)
+                if nid not in nodes_run:
+                    nodes_run.append(nid)
+
         finished = _now()
         events.append(self.project.events_path, "orch.run.finish", actor=actor,
                       data={"run_id": run_id, "waves": waves_executed,
@@ -280,6 +304,119 @@ class Runner:
             nodes_run=nodes_run, nodes_succeeded=nodes_succeeded,
             nodes_failed=nodes_failed, nodes_skipped=nodes_skipped,
         )
+
+    # ------------------------------------------------------------------
+    # HW-0028: flow inbox drain
+    # ------------------------------------------------------------------
+
+    def _drain_flow_inboxes(self, *, run_id: str,
+                            actor: Optional[str]) -> Dict[str, List[str]]:
+        """Walk every executor's inbox and try to dispatch pending pushes.
+
+        For each pending push:
+          * Load the target Node.
+          * Match a processor by the node's component shape (the normal
+            `match_processor` mechanism).
+          * If no match: ack with outcome=no-processor (doesn't enter).
+          * If match: run processor.
+              - success: ack outcome=success; enter the target executor;
+                check for auto-done (all required terminals reached).
+              - failure: ack outcome=failure; do not enter.
+              - skip:    ack outcome=skip;    do not enter.
+
+        Concurrency guard: if the push has already been ack'd by this
+        executor (race between runs, or a prior manual ack), the inbox
+        projection would have dropped it — so `flow.inbox()` returning
+        the push means it is genuinely pending. We additionally record
+        each processed push in this run's local set to avoid acking a
+        push twice within the same run.
+
+        Returns `{"succeeded": [...], "failed": [...], "skipped": [...]}`
+        with WorkItem node ids (not executors).
+        """
+        from hopewell import network as net_mod
+
+        succeeded: List[str] = []
+        failed: List[str] = []
+        skipped: List[str] = []
+
+        try:
+            net = net_mod.load_network(self.project.root)
+        except Exception:  # noqa: BLE001 — no network configured, nothing to do
+            return {"succeeded": succeeded, "failed": failed, "skipped": skipped}
+
+        if not net.executors:
+            return {"succeeded": succeeded, "failed": failed, "skipped": skipped}
+
+        processed_keys: Set[tuple] = set()
+        # Iterate executors in a stable order.
+        for eid in sorted(net.executors.keys()):
+            pending = flow_mod.inbox(self.project, eid)
+            for entry in pending:
+                nid = entry.get("node")
+                if not nid:
+                    continue
+                key = (eid, nid, entry.get("pushed_at"))
+                if key in processed_keys:
+                    continue
+                processed_keys.add(key)
+
+                # Must still exist (work-item might have been deleted).
+                if not self.project.has_node(nid):
+                    skipped.append(nid)
+                    continue
+                node = self.project.node(nid)
+                rule = match_processor(node)
+
+                events.append(self.project.events_path, "orch.run.flow.dispatch",
+                              node=nid, actor=actor,
+                              data={"run_id": run_id, "executor": eid,
+                                    "processor": rule.name if rule else None})
+
+                if rule is None:
+                    # Ack so the inbox drains; record no-processor outcome.
+                    self.project.flow_ack(nid, eid, outcome="no-processor",
+                                          note="no matching processor", actor=actor)
+                    skipped.append(nid)
+                    continue
+
+                try:
+                    outcome = rule.fn(self.project, node)
+                except Exception as e:  # noqa: BLE001 — processor failure is data
+                    outcome = ProcessorOutcome(
+                        status="failure",
+                        message=f"processor exception: {type(e).__name__}: {e}"
+                    )
+
+                if outcome.status == "success":
+                    self.project.flow_ack(nid, eid, outcome="success",
+                                          note=outcome.message[:200] if outcome.message else None,
+                                          actor=actor)
+                    # Enter: target now holds a location for the work item.
+                    try:
+                        self.project.flow_enter(nid, eid, actor=actor,
+                                                reason=f"run {run_id}")
+                    except Exception:  # noqa: BLE001 — enter failure shouldn't kill the drain
+                        pass
+                    # Location changes may have satisfied `required`
+                    # terminals — auto-fire done if so.
+                    try:
+                        flow_mod.maybe_auto_done(self.project, nid, actor=actor)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    succeeded.append(nid)
+                elif outcome.status == "skip":
+                    self.project.flow_ack(nid, eid, outcome="skip",
+                                          note=outcome.message[:200] if outcome.message else None,
+                                          actor=actor)
+                    skipped.append(nid)
+                else:
+                    self.project.flow_ack(nid, eid, outcome="failure",
+                                          note=outcome.message[:200] if outcome.message else None,
+                                          actor=actor)
+                    failed.append(nid)
+
+        return {"succeeded": succeeded, "failed": failed, "skipped": skipped}
 
 
 def _now() -> str:
