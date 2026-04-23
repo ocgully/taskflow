@@ -165,6 +165,7 @@ function App() {
     tab === "canvas"   && h(CanvasView,   { state, onSelect }),
     tab === "timeline" && h(TimelineView, { state, onSelect }),
     tab === "uat"      && h(UatView,      { state, onSelect, reload }),
+    tab === "history"  && h(HistoryView,  { onSelect }),
     detailId && h(Detail, {
       id: detailId,
       onSelect,
@@ -519,6 +520,266 @@ function UatView({ state, onSelect, reload }) {
         h("button", { class: "waive", disabled: busy, onClick: () => act(u.id, "waive") }, "waive"),
       ),
     )),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// History view — reverse-chron done nodes, expandable dep tree, full-scope
+// shared-dep indicator.
+//
+// Rules (HW-0037):
+//  * Top-level list = every `done` node, newest close first.
+//  * Expanding a row renders its `blocked_by` tree recursively; leaves or
+//    already-visited-in-THIS-subtree cut recursion (local cycle guard).
+//  * Shared-dep scope = the ENTIRE History view (list + every expanded tree).
+//    Any node appearing more than once gets the link badge; second-and-later
+//    appearances are muted + auto-collapse their own subtrees. Clicking a
+//    muted appearance scrolls to the canonical (first) one.
+// ---------------------------------------------------------------------------
+
+async function fetchHistory(limit = 50, cursor = 0) {
+  const r = await fetch(`/api/history?limit=${limit}&cursor=${cursor}`);
+  if (!r.ok) throw new Error(`/api/history -> ${r.status}`);
+  return r.json();
+}
+
+function fmtCloseDate(iso) {
+  if (!iso) return "—";
+  // Render as YYYY-MM-DD HH:MM (UTC). Keeps the columnar list tidy; if the
+  // ts is unparseable we just fall back to the raw string.
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} `
+       + `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+function HistoryView({ onSelect }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [expanded, setExpanded] = useState(() => new Set());
+  // Canonical-appearance registry — keyed by node id, value is the DOM id
+  // we use to scroll + highlight on shared-dep click.
+  const canonicalRefs = useRef(new Map());
+  const [highlightId, setHighlightId] = useState(null);
+
+  useEffect(() => {
+    let cancel = false;
+    fetchHistory(50, 0).then((d) => { if (!cancel) setData(d); })
+                       .catch((e) => { if (!cancel) setErr(String(e)); });
+    return () => { cancel = true; };
+  }, []);
+
+  const toggle = useCallback((uid) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(uid)) next.delete(uid); else next.add(uid);
+      return next;
+    });
+  }, []);
+
+  // Compute, for the current render, how many times each node id appears
+  // across the full view: every top-level item counts once, plus every node
+  // reached by walking `blocked_by` through expanded rows (cycle-guarded per
+  // walk). The first appearance (in render order) is canonical; all later
+  // appearances are "secondary" → muted + auto-collapsed.
+  //
+  // We return:
+  //   occurrence: Map<id, number>              — how many times it appears
+  //   canonicalUid: Map<id, string>            — DOM id of first appearance
+  // Consumers pass a per-rendering "appearance counter" to tell whether the
+  // row they're rendering is the canonical one.
+  const appearance = useMemo(() => {
+    if (!data) return { counts: new Map(), order: [] };
+    const counts = new Map();
+    const order = [];          // render order ids (first appearance wins)
+    const seenOnce = new Set();
+
+    // Walk the blocked_by subtree of a top-level id for counting purposes,
+    // respecting the "expanded" set (secondary appearances never recurse —
+    // they're auto-collapsed). First-appearance rows recurse if the user
+    // has expanded them. Cycle-guard: track visitedInWalk.
+    const walk = (id, uid, visitedInWalk) => {
+      const first = !seenOnce.has(id);
+      counts.set(id, (counts.get(id) || 0) + 1);
+      if (first) {
+        seenOnce.add(id);
+        order.push(id);
+      }
+      // Only recurse on the CANONICAL first appearance, and only if the user
+      // has expanded this uid. Secondary appearances auto-collapse.
+      if (!first) return;
+      if (!expanded.has(uid)) return;
+      if (visitedInWalk.has(id)) return;
+      const nv = new Set(visitedInWalk); nv.add(id);
+      const n = data.nodes[id];
+      if (!n) return;
+      const kids = n.blocked_by || [];
+      for (const kid of kids) {
+        walk(kid, `${uid}/${kid}`, nv);
+      }
+    };
+
+    for (const item of data.items) {
+      walk(item.id, `root/${item.id}`, new Set());
+    }
+    return { counts, order };
+  }, [data, expanded]);
+
+  const scrollToCanonical = useCallback((id) => {
+    const uid = canonicalRefs.current.get(id);
+    if (!uid) return;
+    const el = document.querySelector(`[data-hist-uid="${CSS.escape(uid)}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightId(id);
+      setTimeout(() => setHighlightId((cur) => (cur === id ? null : cur)), 1600);
+    }
+  }, []);
+
+  // Reset the canonical-refs registry on every render pass; rendering will
+  // re-populate it with fresh DOM ids reflecting the current expansion.
+  canonicalRefs.current = new Map();
+
+  if (err) return h("div", { class: "empty", style: "color: var(--err)" }, err);
+  if (!data) return h("div", { class: "muted" }, "Loading history…");
+  if (!data.items || data.items.length === 0) {
+    return h("div", { class: "empty" }, "No closed nodes yet. Close one with `hopewell close`.");
+  }
+
+  // Recursive tree renderer. `uid` is the unique path id for a row so that
+  // the same underlying node id can appear at multiple tree positions and
+  // have independent expand state. `depth` drives indentation.
+  const renderTree = (id, uid, depth, visitedInWalk) => {
+    const n = data.nodes[id];
+    const count = appearance.counts.get(id) || 0;
+    const shared = count > 1;
+    const firstAppearance = canonicalRefs.current.get(id) === undefined;
+    // Register THIS render as canonical if it's the first time we see `id`.
+    if (firstAppearance) canonicalRefs.current.set(id, uid);
+    const muted = shared && !firstAppearance;
+
+    if (!n) {
+      return h("li", { key: uid, "data-hist-uid": uid, class: "hist-row unknown" },
+        h("span", { class: "hist-caret leaf" }),
+        h("span", { class: "hist-id", onClick: () => onSelect(id) }, id),
+        h("span", { class: "muted" }, " (unknown)"),
+      );
+    }
+
+    const kids = n.blocked_by || [];
+    const hasKids = kids.length > 0;
+    const isExpanded = expanded.has(uid) && !muted;   // secondary never expands
+    const inCycle = visitedInWalk.has(id);
+    const caret = !hasKids || inCycle
+      ? ""
+      : (isExpanded ? "▾" : "▸");
+    const rowClasses = [
+      "hist-row",
+      "hist-tree-row",
+      muted ? "hist-shared-secondary" : "",
+      highlightId === id ? "hist-highlight" : "",
+    ].filter(Boolean).join(" ");
+
+    const clickId = (e) => {
+      e.stopPropagation();
+      if (muted) scrollToCanonical(id);
+      else onSelect(id);
+    };
+
+    return h("li", { key: uid, "data-hist-uid": uid, class: rowClasses },
+      h("div", {
+        class: "hist-line",
+        style: depth ? `padding-left:${depth * 16}px` : "",
+      },
+        h("span", {
+          class: "hist-caret" + (!hasKids || inCycle ? " leaf" : ""),
+          onClick: () => hasKids && !inCycle && !muted && toggle(uid),
+          title: inCycle ? "cycle guard" : (hasKids ? `${kids.length} blocker${kids.length === 1 ? "" : "s"}` : ""),
+        }, caret),
+        h("span", { class: "hist-id", onClick: clickId }, n.id),
+        h("span", { class: "hist-title", onClick: clickId }, " " + n.title),
+        shared && h("span", {
+          class: "hist-shared-badge",
+          title: muted
+            ? `also shown above (×${count}). Click to jump to canonical appearance.`
+            : `shared — ×${count} across view`,
+          onClick: (e) => { e.stopPropagation(); if (muted) scrollToCanonical(id); },
+        }, "⇆"),
+        h("span", { class: `badge status-${n.status}` }, n.status),
+        inCycle && h("span", { class: "muted", style: "font-size:10px" }, " (cycle)"),
+      ),
+      hasKids && isExpanded && !inCycle && h("ul", { class: "hist-children" },
+        kids.map((k) => {
+          const nv = new Set(visitedInWalk); nv.add(id);
+          return renderTree(k, `${uid}/${k}`, depth + 1, nv);
+        })),
+    );
+  };
+
+  return h("div", { class: "history" },
+    h("div", { class: "muted hist-summary" },
+      `${data.total} closed node${data.total === 1 ? "" : "s"}`
+      + (data.next !== null ? ` — showing ${data.cursor + 1}..${data.cursor + data.items.length}` : "")),
+    h("ul", { class: "hist-list" },
+      data.items.map((item) => {
+        const uid = `root/${item.id}`;
+        const count = appearance.counts.get(item.id) || 0;
+        const shared = count > 1;
+        const firstAppearance = canonicalRefs.current.get(item.id) === undefined;
+        if (firstAppearance) canonicalRefs.current.set(item.id, uid);
+        const muted = shared && !firstAppearance;
+        const isExpanded = expanded.has(uid) && !muted;
+        const kids = item.blocked_by || [];
+        const hasKids = kids.length > 0;
+
+        return h("li", {
+          key: uid,
+          "data-hist-uid": uid,
+          class: [
+            "hist-row", "hist-top",
+            muted ? "hist-shared-secondary" : "",
+            highlightId === item.id ? "hist-highlight" : "",
+          ].filter(Boolean).join(" "),
+        },
+          h("div", { class: "hist-top-line" },
+            h("span", {
+              class: "hist-caret" + (!hasKids ? " leaf" : ""),
+              onClick: () => hasKids && !muted && toggle(uid),
+            }, hasKids ? (isExpanded ? "▾" : "▸") : ""),
+            h("span", {
+              class: "hist-id",
+              onClick: (e) => {
+                e.stopPropagation();
+                if (muted) scrollToCanonical(item.id);
+                else onSelect(item.id);
+              },
+            }, item.id),
+            h("span", { class: "hist-title" }, " " + item.title),
+            shared && h("span", {
+              class: "hist-shared-badge",
+              title: muted
+                ? `also shown above (×${count}). Click to jump.`
+                : `shared — ×${count} across view`,
+              onClick: (e) => { e.stopPropagation(); if (muted) scrollToCanonical(item.id); },
+            }, "⇆"),
+            h("span", { class: "hist-close-date", title: item.closed_at || "" },
+              fmtCloseDate(item.closed_at)),
+            item.closed_by && h("span", { class: "badge owner" },
+              "@" + String(item.closed_by).replace(/^@/, "")),
+            item.commit && h("span", { class: "badge hist-commit", title: item.commit },
+              (item.commit || "").slice(0, 7)),
+            (item.components || []).slice(0, 3).map((c) => h("span", {
+              key: c, class: "hist-comp", style: `border-color:${colourFor(c)}; color:${colourFor(c)}`,
+            }, c)),
+            (item.components && item.components.length > 3) &&
+              h("span", { class: "muted", style: "font-size:10px" }, `+${item.components.length - 3}`),
+          ),
+          hasKids && isExpanded && h("ul", { class: "hist-children" },
+            kids.map((k) => renderTree(k, `${uid}/${k}`, 1, new Set([item.id]))),
+          ),
+        );
+      })),
   );
 }
 

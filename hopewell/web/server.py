@@ -267,6 +267,121 @@ def create_app(project_root: Path):
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
 
+    @app.get("/api/history")
+    def _history(limit: int = 50, cursor: int = 0) -> Dict[str, Any]:
+        """Return done nodes reverse-chron with close metadata + deps for tree view.
+
+        Close metadata is derived from `node.close` attestations (ts + actor +
+        commit + reason). Nodes that are `done` but have no close attestation
+        (e.g. legacy data) fall back to the node's `updated` timestamp and
+        empty actor/commit.
+
+        Response shape:
+            {
+              "items":  [ { "id", "title", "components", "priority", "closed_at",
+                            "closed_by", "commit", "reason", "blocked_by" }, ... ],
+              "nodes":  { id -> { "id", "title", "status", "components",
+                                  "blocked_by", "closed_at" } }   # for tree lookup
+              "total":  N,
+              "limit":  L,
+              "cursor": C,
+              "next":   C+L or None
+            }
+        """
+        from hopewell import attestation as att_mod
+        p = _load_project(project_root)
+
+        # 1. all nodes — build a summary index used by the tree view.
+        all_nodes = p.all_nodes()
+        summary: Dict[str, Dict[str, Any]] = {}
+        for n in all_nodes:
+            s = n.status.value if hasattr(n.status, "value") else n.status
+            summary[n.id] = {
+                "id": n.id,
+                "title": n.title,
+                "status": s,
+                "components": list(n.components),
+                "blocked_by": list(n.blocked_by),
+            }
+
+        # 2. scrape node.close attestations — latest wins per node.
+        close_meta: Dict[str, Dict[str, Any]] = {}
+        try:
+            for att in att_mod.iter_attestations(p.attestations_path):
+                if att.get("kind") != "node.close":
+                    continue
+                nid = att.get("node")
+                if not nid:
+                    continue
+                # keep the latest ts
+                prev = close_meta.get(nid)
+                ts = att.get("ts") or ""
+                if prev is None or ts > (prev.get("ts") or ""):
+                    close_meta[nid] = {
+                        "ts": ts,
+                        "actor": att.get("actor"),
+                        "commit": att.get("commit"),
+                        "reason": att.get("reason"),
+                    }
+        except Exception:
+            # attestations.jsonl absent is fine — fall through to updated-ts fallback.
+            pass
+
+        # 3. done nodes sorted by close ts desc.
+        done_nodes = [n for n in all_nodes
+                      if (n.status.value if hasattr(n.status, "value") else n.status) == "done"]
+
+        def _ts_for(n) -> str:
+            meta = close_meta.get(n.id)
+            if meta and meta.get("ts"):
+                return meta["ts"]
+            return n.updated or n.created or ""
+
+        done_nodes.sort(key=_ts_for, reverse=True)
+        total = len(done_nodes)
+
+        # Attach closed_at to summary entries so the tree view can style
+        # secondary appearances with their own timestamp if wanted.
+        for n in done_nodes:
+            if n.id in summary:
+                summary[n.id]["closed_at"] = _ts_for(n)
+
+        # 4. pagination.
+        try:
+            cur = max(int(cursor or 0), 0)
+        except (TypeError, ValueError):
+            cur = 0
+        try:
+            lim = max(int(limit or 50), 1)
+        except (TypeError, ValueError):
+            lim = 50
+        slice_ = done_nodes[cur:cur + lim]
+
+        items: List[Dict[str, Any]] = []
+        for n in slice_:
+            meta = close_meta.get(n.id, {})
+            items.append({
+                "id": n.id,
+                "title": n.title,
+                "priority": n.priority,
+                "components": list(n.components),
+                "blocked_by": list(n.blocked_by),
+                "closed_at": _ts_for(n),
+                "closed_by": meta.get("actor"),
+                "commit": meta.get("commit"),
+                "reason": meta.get("reason"),
+            })
+
+        nxt = cur + lim if cur + lim < total else None
+        return {
+            "items": items,
+            "nodes": summary,
+            "total": total,
+            "limit": lim,
+            "cursor": cur,
+            "next": nxt,
+        }
+
     @app.get("/api/waves")
     def _waves() -> Dict[str, Any]:
         from hopewell import query as query_mod

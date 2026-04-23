@@ -276,6 +276,140 @@ footer.bottom {
 .uat .status-chip.failed  { color: var(--err); }
 .uat .status-chip.waived  { color: var(--fg-muted); }
 
+/* ---- History (HW-0037) ---- */
+
+.history { display: flex; flex-direction: column; gap: 6px; }
+.hist-summary { font-size: 11px; margin-bottom: 2px; }
+.hist-list, .hist-children {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.hist-children { margin-top: 1px; }
+
+.hist-row.hist-top {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  margin-bottom: 3px;
+}
+
+.hist-top-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.hist-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hist-line:hover { background: var(--bg-3); }
+
+.hist-caret {
+  display: inline-block;
+  width: 10px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  user-select: none;
+  text-align: center;
+  cursor: pointer;
+}
+.hist-caret.leaf { visibility: hidden; cursor: default; }
+
+.hist-id {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+}
+.hist-id:hover { text-decoration: underline; }
+.hist-title { flex: 0 1 auto; }
+
+.hist-close-date {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+}
+
+.hist-comp {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, monospace;
+}
+
+.hist-row .badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+.hist-row .badge.status-done { color: var(--ok); border-color: rgba(91, 212, 155, 0.35); }
+.hist-row .badge.owner { color: var(--accent); border-color: rgba(110, 168, 255, 0.35); }
+.hist-row .badge.hist-commit {
+  color: var(--fg-muted);
+  font-family: ui-monospace, monospace;
+}
+
+/* Shared-dep indicator — the ⇆ badge + muted secondary appearances. */
+.hist-shared-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: rgba(161, 122, 255, 0.18);
+  border: 1px solid rgba(161, 122, 255, 0.55);
+  color: var(--accent-2);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.hist-shared-badge:hover {
+  background: rgba(161, 122, 255, 0.32);
+}
+
+.hist-shared-secondary {
+  opacity: 0.55;
+}
+.hist-shared-secondary .hist-id,
+.hist-shared-secondary .hist-title {
+  color: var(--fg-muted);
+}
+.hist-shared-secondary .hist-shared-badge {
+  background: transparent;
+  color: var(--fg-muted);
+  border-color: var(--border);
+}
+
+/* Brief pulse when jumping to the canonical appearance. */
+.hist-highlight > .hist-line,
+.hist-highlight > .hist-top-line,
+.hist-highlight.hist-top {
+  animation: hist-pulse 1.4s ease-out;
+  outline: 1px solid var(--accent-2);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+@keyframes hist-pulse {
+  0%   { background: rgba(161, 122, 255, 0.25); }
+  100% { background: transparent; }
+}
+
 /* ---- Detail panel ---- */
 
 .detail {
