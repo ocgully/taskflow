@@ -16,6 +16,7 @@ from hopewell import claim as claim_mod
 from hopewell import events as events_mod
 from hopewell import evolve as evolve_mod
 from hopewell import extensions as extensions_mod
+from hopewell import flow_cli as flow_cli_mod
 from hopewell import hooks as hooks_mod
 from hopewell import merge_driver as merge_driver_mod
 from hopewell import network_cli as network_cli_mod
@@ -1055,6 +1056,54 @@ def _build_parser() -> argparse.ArgumentParser:
     np = nsub.add_parser("validate", help="Run validation rules")
     np.add_argument("--format", choices=["text", "json"], default="text")
     np.set_defaults(func=lambda a: network_cli_mod.cmd_network_validate(a))
+
+    # flow — flow runtime: push/ack/enter/leave/where/inbox (HW-0028)
+    sp = sub.add_parser("flow", help="Flow runtime: push/ack/enter/leave/inbox (v0.8)")
+    fsub = sp.add_subparsers(dest="flow_cmd", required=True)
+
+    fp = fsub.add_parser("enter", help="Add a location on a work item")
+    fp.add_argument("node_id")
+    fp.add_argument("--executor", required=True)
+    fp.add_argument("--artifact", default=None)
+    fp.add_argument("--reason", default=None)
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_enter(a))
+
+    fp = fsub.add_parser("leave", help="Close a location on a work item")
+    fp.add_argument("node_id")
+    fp.add_argument("--executor", required=True)
+    fp.add_argument("--reason", default=None)
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_leave(a))
+
+    fp = fsub.add_parser("where", help="Show active locations for a work item")
+    fp.add_argument("node_id")
+    fp.add_argument("--history", action="store_true",
+                    help="include closed (historical) locations")
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_where(a))
+
+    fp = fsub.add_parser("inbox", help="Show pending pushes for an executor")
+    fp.add_argument("executor_id")
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_inbox(a))
+
+    fp = fsub.add_parser("push", help="Offer a work item to a target inbox")
+    fp.add_argument("node_id")
+    fp.add_argument("--to", required=True, dest="to_executor")
+    fp.add_argument("--from", default=None, dest="from_executor")
+    fp.add_argument("--artifact", default=None)
+    fp.add_argument("--reason", default=None)
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_push(a))
+
+    fp = fsub.add_parser("ack", help="Ack a pending push")
+    fp.add_argument("node_id")
+    fp.add_argument("--executor", required=True)
+    fp.add_argument("--outcome", default="processed")
+    fp.add_argument("--note", default=None)
+    fp.add_argument("--format", choices=["text", "json"], default="text")
+    fp.set_defaults(func=lambda a: flow_cli_mod.cmd_flow_ack(a))
 
     # resume + checkpoint (v0.5.3 session-resume protocol)
     sp = sub.add_parser("resume", help="Show your active work + where you left off on each node")
