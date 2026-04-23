@@ -48,8 +48,20 @@ def show(project: Project, node_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def ready(project: Project, *, owner: Optional[str] = None) -> Dict[str, Any]:
+def ready(project: Project, *, owner: Optional[str] = None,
+          include_claimed: bool = False) -> Dict[str, Any]:
     by_id = {n.id: n for n in project.all_nodes()}
+
+    # v0.5: filter out nodes that are currently claimed (remote branch + unreleased local claim).
+    claimed_ids: set = set()
+    if not include_claimed:
+        try:
+            from hopewell import claim as claim_mod
+            for c in claim_mod.query_claims(project):
+                claimed_ids.add(c.node_id)
+        except Exception:
+            pass
+
     out: List[Node] = []
     for n in by_id.values():
         s = n.status if isinstance(n.status, NodeStatus) else NodeStatus(n.status)
@@ -57,12 +69,15 @@ def ready(project: Project, *, owner: Optional[str] = None) -> Dict[str, Any]:
             continue
         if owner and n.owner != owner:
             continue
+        if n.id in claimed_ids:
+            continue
         if _all_blockers_done(n, by_id) and _all_inputs_satisfied(n, by_id):
             out.append(n)
     return {
         "query": "ready",
-        "filters": {"owner": owner},
+        "filters": {"owner": owner, "include_claimed": include_claimed},
         "count": len(out),
+        "excluded_claimed": sorted(claimed_ids),
         "nodes": [_node_summary(n) for n in sorted(out, key=lambda x: (x.priority, x.id))],
     }
 
@@ -213,6 +228,18 @@ def component_nodes(project: Project, component: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # full graph export (for web UI later; useful now too)
 # ---------------------------------------------------------------------------
+
+
+def claims(project: Project, node_id: Optional[str] = None) -> Dict[str, Any]:
+    """Return active claims (remote branches + unreleased local claims)."""
+    from hopewell import claim as claim_mod
+    active = claim_mod.query_claims(project, node_id=node_id)
+    return {
+        "query": "claims",
+        "filters": {"node_id": node_id},
+        "count": len(active),
+        "claims": [c.to_dict() for c in active],
+    }
 
 
 def graph(project: Project) -> Dict[str, Any]:

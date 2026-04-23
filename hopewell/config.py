@@ -27,6 +27,15 @@ class GithubConfig:
 
 
 @dataclass
+class CoordinationConfig:
+    # Branch-as-claim (v0.5). "auto" = use if origin exists + remote reachable;
+    # "always" = require push; "never" = local claims only.
+    mode: str = "auto"
+    base_branch: str = "main"
+    stale_claim_days: int = 14
+
+
+@dataclass
 class OrchestratorConfig:
     max_parallel: int = 4
 
@@ -39,6 +48,7 @@ class ProjectConfig:
     enabled_components: List[str] = field(default_factory=list)
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     github: GithubConfig = field(default_factory=GithubConfig)
+    coordination: CoordinationConfig = field(default_factory=CoordinationConfig)
 
     @classmethod
     def default(cls, name: str = "unnamed") -> "ProjectConfig":
@@ -79,6 +89,13 @@ class ProjectConfig:
         ]
         for label, comp in sorted(self.github.label_to_components.items()):
             lines.append(f'"{label}" = "{comp}"')
+        lines += [
+            "",
+            "[coordination]",
+            f'mode = "{self.coordination.mode}"               # auto | always | never',
+            f'base_branch = "{self.coordination.base_branch}"',
+            f'stale_claim_days = {self.coordination.stale_claim_days}',
+        ]
         return "\n".join(lines) + "\n"
 
 
@@ -105,6 +122,7 @@ def _from_dict(d: Dict[str, Any]) -> ProjectConfig:
     comp = d.get("components", {}) or {}
     orch = d.get("orchestrator", {}) or {}
     gh = d.get("github", {}) or {}
+    coord = d.get("coordination", {}) or {}
 
     cfg = ProjectConfig(
         name=proj.get("name", "unnamed"),
@@ -120,6 +138,11 @@ def _from_dict(d: Dict[str, Any]) -> ProjectConfig:
             label_to_components=dict(gh.get("label_to_components", {})),
             sync_interval_minutes=int(gh.get("sync_interval_minutes", 0)),
             token_env=gh.get("token_env", "GITHUB_TOKEN"),
+        ),
+        coordination=CoordinationConfig(
+            mode=coord.get("mode", "auto"),
+            base_branch=coord.get("base_branch", "main"),
+            stale_claim_days=int(coord.get("stale_claim_days", 14)),
         ),
     )
     if not cfg.enabled_components:

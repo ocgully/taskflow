@@ -101,6 +101,10 @@ class Project:
         if not edges_log.is_file():
             edges_log.write_text("", encoding="utf-8")
 
+        # Git merge driver + .gitattributes for JSONL append-only logs (v0.5).
+        # Best-effort: only activates in a git worktree.
+        _install_merge_driver(root)
+
         return cls.load(root)
 
     # ---- paths ----
@@ -422,3 +426,53 @@ def _find_cycles(adj: Dict[str, List[str]]) -> List[List[str]]:
 def _now() -> str:
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Merge driver + .gitattributes installer (v0.5)
+# ---------------------------------------------------------------------------
+
+
+_GITATTR_LINES = [
+    ".hopewell/events.jsonl        merge=hopewell-jsonl",
+    ".hopewell/attestations.jsonl  merge=hopewell-jsonl",
+    ".hopewell/edges.jsonl         merge=hopewell-jsonl",
+    ".hopewell/agents.jsonl        merge=hopewell-jsonl",
+]
+
+_GITATTR_MARKER = "# --- hopewell jsonl merge driver (managed) ---"
+_GITATTR_END = "# --- /hopewell jsonl merge driver ---"
+
+
+def _install_merge_driver(project_root: Path) -> None:
+    """Write .gitattributes block + configure `merge.hopewell-jsonl.driver`.
+
+    Silently no-ops if we're not in a git worktree — the project still works
+    without the driver; it just means git-level conflicts on jsonl files
+    would need manual resolution.
+    """
+    gitattr = project_root / ".gitattributes"
+    existing = gitattr.read_text(encoding="utf-8") if gitattr.is_file() else ""
+    if _GITATTR_MARKER not in existing:
+        block = (
+            ("\n" if existing and not existing.endswith("\n") else "")
+            + f"{_GITATTR_MARKER}\n"
+            + "\n".join(_GITATTR_LINES) + "\n"
+            + f"{_GITATTR_END}\n"
+        )
+        gitattr.write_text(existing + block, encoding="utf-8")
+
+    if (project_root / ".git").exists():
+        try:
+            subprocess.run(
+                ["git", "config", "merge.hopewell-jsonl.driver",
+                 "hopewell merge-driver jsonl %O %A %B"],
+                cwd=str(project_root), check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "config", "merge.hopewell-jsonl.name",
+                 "Hopewell JSONL timestamp-sorted merge"],
+                cwd=str(project_root), check=True, capture_output=True, timeout=10,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass

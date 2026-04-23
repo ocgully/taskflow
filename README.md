@@ -8,9 +8,10 @@ components riding a DAG that agents can execute.
 Named after a ship in *Gulliver's Travels*. Work *sails* through a network
 of ports (nodes), carrying cargo (artifacts).
 
-> **Status: v0.4.** CLI + Python library + basic orchestrator + GitHub
-> ingestion + **attestation ledger + agent fingerprinting**. Web UI and
-> LLM-driven graph evolution still pending. See **Roadmap** below.
+> **Status: v0.5.** CLI + Python library + basic orchestrator + GitHub
+> ingestion + attestation ledger + agent fingerprinting + **coordination
+> (branch-as-claim + JSONL merge driver)**. Web UI and LLM-driven graph
+> evolution still pending. See **Roadmap** below.
 
 ---
 
@@ -81,9 +82,93 @@ hopewell close HW-0001 --commit abc123 --reason "tests pass, shipped"
 hopewell hooks install
 ```
 
+## Coordination — multiple agents & humans in the same repo
+
+Hopewell coordinates concurrent work with **pure git** — no server, no
+central mediator required. The design rests on two primitives:
+
+1. **Branch-as-claim** — to start work, push `hopewell/<node-id>`. Git's
+   non-fast-forward rejection IS the mutex: first pusher wins. Second
+   agent sees a collision and picks another ready node.
+2. **JSONL merge driver** — `.hopewell/events.jsonl` and siblings are
+   append-only; a shipped merge driver unions + timestamp-sorts them so
+   concurrent branches merge cleanly. Wired automatically at
+   `hopewell init`.
+
+```bash
+# Agent A
+hopewell claim HW-0042                          # pushes hopewell/HW-0042; OK, I own it.
+# … work, commits, eventually …
+hopewell close HW-0042 --commit abc123
+# After PR merge, clean up:
+hopewell release HW-0042                        # deletes the branch remote+local
+
+# Agent B, same repo, parallel session
+hopewell ready                                  # HW-0042 filtered out (claimed)
+hopewell claim HW-0050                          # different node, no collision
+
+# Agent C tries HW-0042 too:
+hopewell claim HW-0042
+# { "claim": "collision", "branch": "hopewell/HW-0042",
+#   "existing": {"claimer": "@alice", "pushed_at": "…", "age_hours": 0.5},
+#   "hint": "Pick another ready task or ask the claimer to release." }
+```
+
+### Race-condition matrix
+
+| Race | Layer that handles it | Result |
+|------|-----------------------|--------|
+| Two agents create the same task | n/a — each gets a unique node id | No collision |
+| Two agents grab the same ready task | `hopewell claim` atomic git push | First wins; second gets `ClaimCollision` with the existing claimer's info |
+| Two agents both close to main | Normal git merge rules | Standard git dance |
+| Claim abandoned (agent dies mid-work) | `hopewell prune-claims --stale-days N` | Sweeps branches whose last commit is > N days old |
+| Offline work | `hopewell claim HW-0042 --offline` | Writes a local claim event without pushing; sync-on-reconnect is operator-driven |
+| Private repo, solo developer | Works unchanged | `hopewell ready` + `claim` + `release` all local; the branch still reserves the name remotely if you push |
+| Concurrent appends to `events.jsonl` on two branches | JSONL merge driver + `.gitattributes` | Auto-merges; ordered by `ts`; dedupes identical lines |
+| Two processes run `orch run` on the same tree | Local-only danger; one-liner you-probably-won't-hit | Advisory lock in `.hopewell/orchestrator/` (in progress — see roadmap) |
+| Slug variants (A claims `HW-0042-foo`, B tries plain `HW-0042`) | Claim check matches `hopewell/HW-0042[-*]` before push | B sees collision on A's slugged branch |
+
+### Claim lifecycle
+
+```
+idea/ready ── hopewell claim ──► doing       (branch hopewell/<id> pushed)
+                               │
+         hopewell close ◄──────┴──► hopewell release  (branch deleted)
+                                          │
+                               merged PR  ─┴─► clean state
+```
+
+- `hopewell claim <id>` creates + pushes `hopewell/<id>`. Fails atomically on collision.
+- `hopewell claim <id> --offline` writes a local claim event; skip the push. Useful disconnected or for solo work that'll never push.
+- `hopewell claim <id> --slug <word>` appends a readable slug — `hopewell/<id>-<slug>`. Still collides with un-slugged variants of the same node.
+- `hopewell release <id>` deletes every `hopewell/<id>[-*]` branch (local + remote).
+- `hopewell query claims [<id>]` lists every active claim (remote branches + unreleased local events), with claimer + last-commit age.
+- `hopewell prune-claims --stale-days 14` deletes abandoned claim branches.
+
+### Why not Jira / GitHub Issues as mediator?
+
+Considered and rejected for coordination *per se* — they're **UI for
+humans**, not coordination primitives. Branch-push gives you the same
+mutex with no SaaS dependency, full offline capability, and automatic
+cleanup when the PR merges. (Hopewell still has one-way **ingestion**
+from GitHub Issues — see next section — for the case where tasks
+originate outside the team. That's orthogonal to coordination.)
+
+### Policy for teams adopting Hopewell
+
+1. **Rule**: before starting any work, run `hopewell claim <id>`. If it succeeds, you have the branch. If it collides, pick another task or coordinate with the current claimer through your normal team channels.
+2. **Rule**: `hopewell ready` is the canonical "what can I pick up" query. It filters out nodes with active claims by default.
+3. **Rule**: close nodes through the CLI (`hopewell close`) or via a commit message reference (`fixes HW-0042`). The post-commit hook + your PR merge handle the rest.
+4. **Rule**: release (or let auto-prune sweep) stale claims promptly. A lingering claim is lock pollution.
+
+---
+
 ## GitHub ingestion
 
-One-way sync: GitHub issues → Hopewell nodes.
+One-way sync: GitHub issues → Hopewell nodes. Used for cases where tasks
+**originate outside the team** (customer bug reports, community
+feature requests). Coordination itself is handled by branch-as-claim
+above; this is strictly for ingesting external task sources.
 
 ```toml
 # .hopewell/config.toml
@@ -256,6 +341,12 @@ hopewell agent list
 hopewell agent fingerprint <name> [--doc <path>]     # optionally re-hash doc
 hopewell agent quality <name>                         # per-fingerprint metrics
 
+# v0.5 coordination
+hopewell claim <id> [--slug <word>] [--base <branch>] [--offline] [--no-push]
+hopewell release <id> [--keep-remote]
+hopewell prune-claims [--stale-days 14]
+hopewell query claims [<id>]
+
 hopewell orch {plan|run|status} [--dry-run] [--max N]
 
 hopewell github {sync|pull|config} [ref] [--since <ts>] [--state open|closed|all]
@@ -311,11 +402,12 @@ scripts can do without shelling out.
 | **v0.1** | Foundations: model, storage, CLI (init/new/show/list/touch/link/close/check/graph/render), library, hooks, .claudeignore |
 | **v0.2** | Query + Scheduler: ready/deps/waves/critical-path/metrics |
 | **v0.3** | Orchestrator basic + **GitHub ingestion** |
-| **v0.4** | **Attestation ledger + agent fingerprinting (doc-SHA); `hopewell agent register / list / fingerprint / quality`; `hopewell query attestations`; quality metrics (nodes closed, reopens, defects-traced, avg review iterations) per fingerprint** |
-| v0.5 | LLM-driven graph evolution (`hopewell evolve ...`), loops |
-| v0.6 | Web UI (FastAPI + SSE + zero-build tree/canvas/timeline) |
-| v0.7 | Custom Python processors + YAML component loader + agent-dispatch processor |
-| v0.8 | Replace SpecKit planning artefacts |
+| **v0.4** | Attestation ledger + agent fingerprinting (doc-SHA); `hopewell agent register / list / fingerprint / quality`; `hopewell query attestations`; quality metrics per fingerprint |
+| **v0.5** | **Coordination: branch-as-claim (`hopewell claim / release / prune-claims`), collision detection across slug variants, claim-aware `hopewell ready` + `hopewell query claims`, JSONL merge driver + `.gitattributes` installed on init, `[coordination]` config section** |
+| v0.6 | LLM-driven graph evolution (`hopewell evolve ...`), loops |
+| v0.7 | Web UI (FastAPI + SSE + zero-build tree/canvas/timeline) |
+| v0.8 | Custom Python processors + YAML component loader + agent-dispatch processor |
+| v0.9 | Replace SpecKit planning artefacts |
 
 ---
 

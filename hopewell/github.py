@@ -258,6 +258,8 @@ def _components_for_issue(issue: Dict[str, Any], label_map: Dict[str, str],
     return sorted(out)
 
 
+
+
 def _iter_issues(repo: str, *, state: str = "all", since: Optional[str] = None,
                  token: Optional[str] = None) -> Iterable[Dict[str, Any]]:
     """Iterate all issues matching the filters, handling pagination."""
@@ -284,7 +286,7 @@ def _get_issue(repo: str, number: int, *, token: Optional[str] = None) -> Dict[s
 def _http_json(url: str, *, token: Optional[str], include_next: bool):
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "hopewell/0.4 (+https://github.com/ocgully/Hopewell)",
+        "User-Agent": "hopewell/0.5 (+https://github.com/ocgully/Hopewell)",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:

@@ -5,14 +5,17 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
 from hopewell import __version__, SCHEMA_VERSION
 from hopewell import attestation as att_mod
+from hopewell import claim as claim_mod
 from hopewell import events as events_mod
 from hopewell import hooks as hooks_mod
+from hopewell import merge_driver as merge_driver_mod
 from hopewell import paths as paths_mod
 from hopewell.model import EdgeKind, NodeStatus
 
@@ -205,6 +208,75 @@ def cmd_render(args) -> int:
     return 0
 
 
+def cmd_claim(args) -> int:
+    project = _project(args)
+    try:
+        c = claim_mod.claim(project, args.id, slug=args.slug, offline=args.offline,
+                            base=args.base, actor=_actor_from_env(), push=not args.no_push)
+    except claim_mod.ClaimCollision as exc:
+        ex = exc.existing
+        _print_json({
+            "claim": "collision",
+            "branch": exc.branch,
+            "existing": ex.to_dict() if ex else None,
+            "hint": "Pick another ready task or ask the claimer to release.",
+        })
+        return 1
+    except FileNotFoundError as exc:
+        print(f"hopewell: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        print(f"hopewell: git failed — {exc.stderr.strip() if exc.stderr else exc}", file=sys.stderr)
+        return 2
+
+    if args.format == "json":
+        _print_json(c.to_dict())
+    else:
+        mode = "local-only" if c.local else "pushed"
+        print(f"claimed {c.node_id} on branch {c.branch} ({mode})")
+        if not c.local:
+            print(f"  upstream: origin/{c.branch}")
+        print(f"  next: start your work, then `hopewell close {c.node_id} ...` when done.")
+    return 0
+
+
+def cmd_release(args) -> int:
+    project = _project(args)
+    deleted = claim_mod.release(project, args.id, actor=_actor_from_env(),
+                                delete_remote=not args.keep_remote)
+    if args.format == "json":
+        _print_json({"node": args.id, "deleted_branches": deleted})
+    else:
+        if deleted:
+            print(f"released {args.id}: deleted {len(deleted)} branch(es)")
+            for b in deleted:
+                print(f"  - {b}")
+        else:
+            print(f"no claim branches found for {args.id}")
+    return 0
+
+
+def cmd_prune_claims(args) -> int:
+    project = _project(args)
+    pruned = claim_mod.prune_stale(project, stale_days=args.stale_days,
+                                   actor=_actor_from_env())
+    if args.format == "json":
+        _print_json({"stale_days": args.stale_days, "pruned": pruned})
+    else:
+        if not pruned:
+            print(f"no stale claims (>{args.stale_days}d) found")
+        else:
+            print(f"pruned {len(pruned)} stale claim(s):")
+            for b in pruned:
+                print(f"  - {b}")
+    return 0
+
+
+def cmd_merge_driver(args) -> int:
+    # Invoked by git: `hopewell merge-driver jsonl <ancestor> <ours> <theirs>`
+    return merge_driver_mod.run_cli([args.kind, args.ancestor, args.ours, args.theirs])
+
+
 def cmd_info(args) -> int:
     try:
         project = _project(args)
@@ -265,6 +337,8 @@ def cmd_query(args) -> int:
                 limit=args.limit,
             ),
         }
+    elif args.subject == "claims":
+        data = q.claims(project, node_id=args.name)
     else:
         print(f"hopewell: unknown query subject '{args.subject}'", file=sys.stderr)
         return 1
@@ -593,7 +667,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("query", help="Read-only JSON queries")
     sp.add_argument("subject", choices=["ready", "deps", "waves", "critical-path",
                                         "component", "metrics", "graph", "show",
-                                        "attestations"])
+                                        "attestations", "claims"])
     sp.add_argument("name", nargs="?", default=None)
     sp.add_argument("--owner", default=None)
     sp.add_argument("--transitive", action="store_true")
@@ -612,6 +686,36 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--doc", default=None, help="Path to agent doc file (for fingerprint)")
     sp.add_argument("--fingerprint", default=None, help="Explicit fingerprint hex (12 chars) if --doc isn't handy")
     sp.set_defaults(func=cmd_agent)
+
+    # claim / release / prune-claims (v0.5 coordination)
+    sp = sub.add_parser("claim", help="Claim a node by pushing a hopewell/<id> branch")
+    sp.add_argument("id")
+    sp.add_argument("--slug", default=None, help="Append -<slug> to the branch for readability")
+    sp.add_argument("--base", default=None, help="Branch from this base instead of current HEAD")
+    sp.add_argument("--offline", action="store_true", help="Write a local claim event without pushing")
+    sp.add_argument("--no-push", action="store_true", help="Create the branch locally only")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=cmd_claim)
+
+    sp = sub.add_parser("release", help="Release a claim — delete hopewell/<id>[-*] branches")
+    sp.add_argument("id")
+    sp.add_argument("--keep-remote", action="store_true",
+                    help="Delete the local branch only; keep the remote branch in place")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=cmd_release)
+
+    sp = sub.add_parser("prune-claims", help="Delete stale claim branches on origin")
+    sp.add_argument("--stale-days", type=int, default=14)
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=cmd_prune_claims)
+
+    # merge-driver — invoked by git, not humans.
+    sp = sub.add_parser("merge-driver", help=argparse.SUPPRESS)
+    sp.add_argument("kind", choices=["jsonl"])
+    sp.add_argument("ancestor")
+    sp.add_argument("ours")
+    sp.add_argument("theirs")
+    sp.set_defaults(func=cmd_merge_driver)
 
     # orch
     sp = sub.add_parser("orch", help="Orchestrator: plan / run / status")
