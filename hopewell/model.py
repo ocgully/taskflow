@@ -245,6 +245,21 @@ BUILTIN_COMPONENTS: List[Component] = [
             "failure_reason": "string",
         },
     ),
+    Component(
+        name="spec-input",
+        description=(
+            "Quote-by-reference to specific passages of spec files. Each "
+            "recorded slice carries a content hash for drift detection and "
+            "a `why` to remind the consumer what they're relying on. See "
+            "`hopewell.spec_input` + `hopewell spec-ref ...` CLI."
+        ),
+        schema={
+            "specs": (
+                "array of {path, doc_sha, slices=[{anchor?, lines=[N,M], "
+                "slice_sha, why?}]}"
+            ),
+        },
+    ),
 ]
 
 
