@@ -109,9 +109,10 @@ On every `Project.load()`:
   `"run `hopewell migrate` to upgrade the project files."`
 - If schemas match → proceed.
 
-Pre-`0.5.2` `.hopewell/` trees don't have a `meta.json`. They auto-heal
-on first load by writing one with the current schema (safe: every
-Hopewell ≤ 0.5.2 stayed on schema 1).
+If `meta.json` is missing for any reason (deleted by hand, filesystem
+glitch), the next `Project.load()` auto-writes one stamped with the
+current package schema + version. Defense-in-depth, never the primary
+path.
 
 ### 2. `[coordination] minimum_version` — the floor
 

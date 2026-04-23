@@ -53,11 +53,10 @@ class Project:
         # Filter registry to enabled components (keeps validation useful without
         # rejecting built-ins a project chose not to enable).
 
-        # v0.5.2: cross-version compatibility gate.
-        #   - If meta.json is missing (legacy .hopewell/), auto-heal by writing
-        #     a current-version stamp. Pre-0.5.2 projects stayed on schema 1,
-        #     so auto-filling with SCHEMA_VERSION="1" is correct.
+        # Cross-version compatibility gate.
         #   - If meta.json is present, check_compatibility raises on mismatch.
+        #   - If meta.json is missing (deleted by hand, filesystem glitch),
+        #     auto-heal by writing a current-version stamp. Defense-in-depth.
         #   - minimum_version from config is enforced regardless.
         hw = paths.hw_dir(root)
         mf = meta_mod.load(hw)

@@ -120,7 +120,7 @@ def _write(hw_dir: Path, mf: MetaFile) -> None:
 def check_compatibility(mf: Optional[MetaFile], *, minimum_version: Optional[str] = None) -> None:
     """Raise HopewellVersionError if this package can't safely act on the project.
 
-    If `mf` is None (legacy .hopewell/ without meta.json), the caller is
+    If `mf` is None (meta.json missing for any reason), the caller is
     expected to auto-heal by writing one; we do not raise here.
     """
     if mf is not None:
