@@ -461,6 +461,68 @@ class Project:
                     frontier.append(nxt)
         return []
 
+    # ---- flow (HW-0028) ----
+    # Thin wrappers around `hopewell.flow`. The flow module owns the
+    # actual logic (events + NodeLocation mutation); Project mirrors the
+    # v0.4 attestation pattern so every flow op is recorded alongside
+    # the event log.
+
+    def flow_enter(self, node_id: str, executor_id: str, *,
+                   artifact: Optional[str] = None, reason: Optional[str] = None,
+                   actor: Optional[str] = None) -> bool:
+        from hopewell import flow as flow_mod
+        added = flow_mod.enter(self, node_id, executor_id,
+                               artifact=artifact, reason=reason, actor=actor)
+        if added:
+            self._attest(kind="flow.enter", node=node_id, actor=actor,
+                         reason=reason,
+                         data={"executor": executor_id, "artifact": artifact})
+        return added
+
+    def flow_leave(self, node_id: str, executor_id: str, *,
+                   reason: Optional[str] = None,
+                   actor: Optional[str] = None) -> bool:
+        from hopewell import flow as flow_mod
+        closed = flow_mod.leave(self, node_id, executor_id,
+                                reason=reason, actor=actor)
+        if closed:
+            self._attest(kind="flow.leave", node=node_id, actor=actor,
+                         reason=reason, data={"executor": executor_id})
+        return closed
+
+    def flow_push(self, node_id: str, to_executor: str, *,
+                  from_executor: Optional[str] = None,
+                  artifact: Optional[str] = None,
+                  reason: Optional[str] = None,
+                  actor: Optional[str] = None) -> Dict[str, Any]:
+        from hopewell import flow as flow_mod
+        ev = flow_mod.push(self, node_id, to_executor,
+                           from_executor=from_executor, artifact=artifact,
+                           reason=reason, actor=actor)
+        self._attest(kind="flow.push", node=node_id, actor=actor, reason=reason,
+                     data={"from": from_executor, "to": to_executor,
+                           "artifact": artifact})
+        return ev
+
+    def flow_ack(self, node_id: str, executor_id: str, *,
+                 outcome: str = "processed", note: Optional[str] = None,
+                 actor: Optional[str] = None) -> Dict[str, Any]:
+        from hopewell import flow as flow_mod
+        ev = flow_mod.ack(self, node_id, executor_id,
+                          outcome=outcome, note=note, actor=actor)
+        self._attest(kind="flow.ack", node=node_id, actor=actor,
+                     data={"executor": executor_id, "outcome": outcome,
+                           "note": note})
+        return ev
+
+    def flow_inbox(self, executor_id: str) -> List[Dict[str, Any]]:
+        from hopewell import flow as flow_mod
+        return flow_mod.inbox(self, executor_id)
+
+    def flow_where(self, node_id: str) -> List[Dict[str, Any]]:
+        from hopewell import flow as flow_mod
+        return flow_mod.where(self, node_id)
+
     # ---- integrity ----
 
     def check(self) -> List[str]:

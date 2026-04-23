@@ -273,6 +273,48 @@ class NodeInput:
 
 
 @dataclass
+class NodeLocation:
+    """A work-item's presence at an Executor (HW-0028).
+
+    A WorkItem can hold multiple locations simultaneously — e.g. it sits
+    at @architect while an Engineering branch runs in parallel. A
+    location is "active" while `left_at` is None; it becomes a
+    historical record once set.
+
+    `last_artifact` is an optional hint about the most recent artifact
+    produced at this executor (for UI + push reasoning).
+    """
+
+    executor_id: str
+    entered_at: str                            # iso ts
+    left_at: Optional[str] = None              # set on exit
+    last_artifact: Optional[str] = None
+
+    def is_active(self) -> bool:
+        return self.left_at is None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "executor_id": self.executor_id,
+            "entered_at": self.entered_at,
+        }
+        if self.left_at is not None:
+            d["left_at"] = self.left_at
+        if self.last_artifact is not None:
+            d["last_artifact"] = self.last_artifact
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "NodeLocation":
+        return cls(
+            executor_id=d.get("executor_id") or d.get("executor") or "",
+            entered_at=d.get("entered_at") or _now(),
+            left_at=d.get("left_at"),
+            last_artifact=d.get("last_artifact"),
+        )
+
+
+@dataclass
 class NodeOutput:
     """Declares something this node produces when it completes."""
 
@@ -302,6 +344,10 @@ class Node:
     blocked_by: List[str] = field(default_factory=list)
     related: List[str] = field(default_factory=list)
     component_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # v0.8 (HW-0028): multi-location presence in the flow network.
+    # A WorkItem can be at several Executors at once; each NodeLocation
+    # records entry/exit timestamps. Orthogonal to `status` and `claim`.
+    locations: List[NodeLocation] = field(default_factory=list)
     body: str = ""                                     # free-form markdown body (not notes)
     notes: List[str] = field(default_factory=list)     # append-only
     # v0.5.2: preserve unknown front-matter fields across round-trips so that
@@ -335,8 +381,19 @@ class Node:
         "id", "status", "priority", "created", "updated",
         "owner", "project", "parent", "components",
         "inputs", "outputs", "blocks", "blocked_by", "related",
-        "component_data",
+        "component_data", "locations",
     }
+
+    # ---- flow/location helpers (HW-0028) ----
+    def active_locations(self) -> List["NodeLocation"]:
+        return [loc for loc in self.locations if loc.is_active()]
+
+    def location_at(self, executor_id: str) -> Optional["NodeLocation"]:
+        """Return the most recent ACTIVE location at `executor_id`, if any."""
+        for loc in reversed(self.locations):
+            if loc.executor_id == executor_id and loc.is_active():
+                return loc
+        return None
 
     def to_frontmatter(self) -> Dict[str, Any]:
         """Convert to the dict we'll serialise into YAML front-matter."""
@@ -367,6 +424,8 @@ class Node:
             d["related"] = list(self.related)
         if self.component_data:
             d["component_data"] = self.component_data
+        if self.locations:
+            d["locations"] = [loc.to_dict() for loc in self.locations]
         # Preserve any fields a newer Hopewell wrote that we don't recognise.
         for k, v in self.extras.items():
             if k not in d:
@@ -393,6 +452,8 @@ class Node:
             blocked_by=list(fm.get("blocked_by", [])),
             related=list(fm.get("related", [])),
             component_data=dict(fm.get("component_data", {})),
+            locations=[NodeLocation.from_dict(x) for x in (fm.get("locations") or [])
+                       if isinstance(x, dict)],
             body=body,
             notes=notes,
             extras=extras,
