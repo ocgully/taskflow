@@ -42,6 +42,9 @@ class Project:
         self.cfg = cfg
         self.registry = registry
         self._agent_registry: Optional[AgentRegistry] = None
+        # Populated by `load_project_extensions` during `Project.load`.
+        self.extension_errors: List[Dict[str, Any]] = []
+        self.extension_summary: Dict[str, Any] = {}
 
     # ---- load / init ----
 
@@ -64,7 +67,29 @@ class Project:
             mf = meta_mod.write_for_init(hw)
         meta_mod.check_compatibility(mf, minimum_version=cfg.coordination.minimum_version)
 
-        return cls(root, cfg, reg)
+        project = cls(root, cfg, reg)
+
+        # Project-level extensions: .hopewell/processors/*.py + .hopewell/components/*.yaml.
+        # Import lazily to avoid a circular import (extensions -> orchestrator -> project).
+        try:
+            from hopewell.extensions import load_project_extensions
+            summary = load_project_extensions(project)
+            project.extension_summary = summary
+            project.extension_errors = list(summary.get("errors", []))
+            if project.extension_errors:
+                events.append(
+                    project.events_path, "project.extensions.errors",
+                    data={"count": len(project.extension_errors),
+                          "errors": project.extension_errors[:10]},
+                )
+        except Exception as e:  # noqa: BLE001 — never let extensions break load
+            project.extension_errors = [{
+                "file": "<loader>",
+                "kind": "loader",
+                "error": f"{type(e).__name__}: {e}",
+            }]
+
+        return project
 
     @classmethod
     def init(cls, root: Path, *, id_prefix: str = "HW", name: Optional[str] = None,

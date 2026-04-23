@@ -91,8 +91,20 @@ class ComponentRegistry:
         self._components: Dict[str, Component] = {}
 
     def register(self, component: Component) -> None:
-        if component.name in self._components:
-            raise ValueError(f"component `{component.name}` already registered")
+        existing = self._components.get(component.name)
+        if existing is not None:
+            # Idempotent re-registration: silently accept the exact same shape
+            # (common when a project's Python code reloads extensions or when
+            # `Project.load` is called twice in one process). Conflicting
+            # shape is still an error — loud failure beats mystery.
+            if (existing.description == component.description
+                    and existing.schema == component.schema
+                    and existing.required_fields == component.required_fields):
+                return
+            raise ValueError(
+                f"component `{component.name}` already registered with a "
+                f"different definition"
+            )
         self._components[component.name] = component
 
     def get(self, name: str) -> Optional[Component]:
