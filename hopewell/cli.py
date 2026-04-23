@@ -17,6 +17,7 @@ from hopewell import events as events_mod
 from hopewell import hooks as hooks_mod
 from hopewell import merge_driver as merge_driver_mod
 from hopewell import paths as paths_mod
+from hopewell import resume as resume_mod
 from hopewell.model import EdgeKind, NodeStatus
 
 
@@ -275,6 +276,31 @@ def cmd_prune_claims(args) -> int:
 def cmd_merge_driver(args) -> int:
     # Invoked by git: `hopewell merge-driver jsonl <ancestor> <ours> <theirs>`
     return merge_driver_mod.run_cli([args.kind, args.ancestor, args.ours, args.theirs])
+
+
+def cmd_resume(args) -> int:
+    """Show this agent's active work + suggested next action per claim."""
+    project = _project(args)
+    data = resume_mod.resume(project, name=args.name, include_all=args.all)
+    if args.format == "json":
+        _print_json(data)
+    else:
+        sys.stdout.write(resume_mod.render_text(data))
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    """Record a [next] checkpoint note on a node — `hopewell resume` surfaces it."""
+    project = _project(args)
+    project_actor = _actor_from_env()
+    try:
+        resume_mod.checkpoint(project, args.id, args.next, actor=project_actor)
+    except FileNotFoundError as exc:
+        print(f"hopewell: {exc}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"checkpoint recorded on {args.id}: [next] {args.next}")
+    return 0
 
 
 def cmd_migrate(args) -> int:
@@ -684,6 +710,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("migrate", help="Re-apply idempotent setup after a Hopewell upgrade")
     sp.add_argument("--quiet", action="store_true")
     sp.set_defaults(func=cmd_migrate)
+
+    # resume + checkpoint (v0.5.3 session-resume protocol)
+    sp = sub.add_parser("resume", help="Show your active work + where you left off on each node")
+    sp.add_argument("name", nargs="?", default=None,
+                    help="Optional actor name (@ prefix auto-added); defaults to $HOPEWELL_ACTOR")
+    sp.add_argument("--all", action="store_true",
+                    help="Show every active claim across the project, not just yours")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=cmd_resume)
+
+    sp = sub.add_parser("checkpoint",
+                        help="Record a [next] note — captures what you were about to do so resume surfaces it")
+    sp.add_argument("id")
+    sp.add_argument("--next", required=True, help="Brief description of the next step")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(func=cmd_checkpoint)
 
     # query
     sp = sub.add_parser("query", help="Read-only JSON queries")

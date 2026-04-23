@@ -174,6 +174,76 @@ audit `project.migrate` entry in `events.jsonl`.
 it won't add a duplicate `project.init` event — but `migrate` is the
 named command for the intent.
 
+## Session resume — picking up mid-work
+
+Agents and humans regularly leave work mid-stream: a Claude Code
+session ends, a developer stops for the day, a CI job wraps. Hopewell's
+session-resume protocol is:
+
+**At session start**:
+```bash
+hopewell resume
+```
+Returns the active claims you hold, nodes in `doing`/`review` you
+own, the latest `[next]` checkpoint on each, and a suggested
+`git switch <branch>` command. Zero guesswork about where to pick up.
+
+**Before stopping mid-work**:
+```bash
+hopewell checkpoint HW-0042 --next "finish the scheduler tests; the retry path still fails"
+```
+Appends a `[next]`-prefixed note to the node. Your next session's
+`hopewell resume` surfaces that line as the suggested next action on
+that claim.
+
+**Session end (work complete)**:
+```bash
+hopewell close HW-0042 --commit <sha> --reason "..."
+```
+Or just let the post-commit hook close it via a commit message like
+`fixes HW-0042`. Either releases the claim.
+
+### Resume output
+
+```
+=== resume for @christopher ===
+
+--- active claims (2) ---
+  HW-0014    [doing ] branch=hopewell/HW-0014
+    title: Hopewell v0.6 LLM-driven graph evolution
+    next:  scaffold evolve.py; wire add-node first, then add-loop
+    -> git switch hopewell/HW-0014
+  HW-0042    [review] branch=hopewell/HW-0042-scheduler
+    title: Implement ECS scheduler v2
+    next:  docs only; kick to technical-writer after tests green
+
+--- doing (2) ---
+  HW-0014    P2  Hopewell v0.6 LLM-driven graph evolution
+    next: scaffold evolve.py; wire add-node first, then add-loop
+  HW-0042    P2  Implement ECS scheduler v2
+
+--- ready to pick up (5) ---
+  HW-0010    P2  Codemap TypeScript Layer 1
+  HW-0011    P3  Codemap Layer 4: assets and user-facing strings
+  ...
+```
+
+`hopewell resume @alice` shows @alice's state (useful for handoffs).
+`hopewell resume --all` shows every active claim across the project
+regardless of claimer.
+
+### Protocol (for agents + humans)
+
+1. **First action of any session**: `hopewell resume`. Don't reconstruct
+   state from `git log` or note timestamps — use the tool.
+2. **Before leaving a node you're not closing**: `hopewell checkpoint
+   <id> --next "..."`. The whole point is that *future you*
+   (or a different agent) doesn't have to re-read the whole file to
+   find out where the work stopped.
+3. **Close via CLI or commit message**. `hopewell close` emits an
+   attestation with the closing commit sha; `fixes HW-NNNN` in a
+   commit message triggers the same via the post-commit hook.
+
 ## Coordination — multiple agents & humans in the same repo
 
 Hopewell coordinates concurrent work with **pure git** — no server, no
@@ -440,6 +510,10 @@ hopewell prune-claims [--stale-days 14]
 hopewell query claims [<id>]
 
 hopewell orch {plan|run|status} [--dry-run] [--max N]
+
+# v0.5.3 session-resume
+hopewell resume [@name] [--all] [--format text|json]
+hopewell checkpoint <id> --next "..."
 
 hopewell github {sync|pull|config} [ref] [--since <ts>] [--state open|closed|all]
 

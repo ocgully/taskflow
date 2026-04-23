@@ -123,6 +123,20 @@ def claim(project, node_id: str, *, slug: Optional[str] = None,
                     data={"branch": branch, "local": offline or not pushed_ok,
                           "pushed": pushed_ok})
 
+    # Claiming means "I'm working on this" — transition to `doing` if the
+    # state-machine allows (idea -> ready -> doing, or blocked/ready -> doing).
+    from hopewell.model import NodeStatus
+    target = project.node(node_id)
+    cur = target.status if isinstance(target.status, NodeStatus) else NodeStatus(target.status)
+    if cur not in (NodeStatus.doing, NodeStatus.review, NodeStatus.done,
+                   NodeStatus.archived, NodeStatus.cancelled):
+        # Walk through permitted transitions to reach doing.
+        for step in (NodeStatus.ready, NodeStatus.doing):
+            try:
+                project.set_status(node_id, step, actor=actor, reason="claim")
+            except ValueError:
+                break
+
     return Claim(
         node_id=node_id, branch=branch, claimer=actor,
         pushed_at=_now_iso() if pushed_ok else None,
