@@ -8,6 +8,12 @@ import { h, render, Fragment } from "https://esm.sh/preact@10.22.0";
 import { useState, useEffect, useMemo, useRef, useCallback }
   from "https://esm.sh/preact@10.22.0/hooks";
 import * as d3 from "https://esm.sh/d3@7.9.0";
+import { marked } from "https://esm.sh/marked@12.0.2";
+
+// Markdown renderer config: GFM on, line breaks on, no raw HTML passthrough.
+// marked escapes HTML by default when `mangle`/`headerIds` aren't configured;
+// we additionally set `breaks: true` so notes-style newlines render as <br>.
+marked.setOptions({ gfm: true, breaks: true });
 
 // ---------------------------------------------------------------------------
 // State + API
@@ -161,6 +167,7 @@ function App() {
     tab === "uat"      && h(UatView,      { state, onSelect, reload }),
     detailId && h(Detail, {
       id: detailId,
+      onSelect,
       onClose: () => setDetailId(null),
     }),
   );
@@ -424,7 +431,136 @@ function UatView({ state, onSelect, reload }) {
 // Detail side panel
 // ---------------------------------------------------------------------------
 
-function Detail({ id, onClose }) {
+// --- Detail helpers ---------------------------------------------------------
+
+// Clickable node-id link: calls onSelect(id) instead of navigating.
+function NodeLink({ id, onSelect }) {
+  return h("a", {
+    class: "node-link",
+    href: "#",
+    onClick: (e) => { e.preventDefault(); onSelect(id); },
+  }, id);
+}
+
+// Join an array of ids into "LINK, LINK, LINK"; returns "—" when empty.
+function NodeLinkList({ ids, onSelect }) {
+  if (!ids || ids.length === 0) return h("span", { class: "muted" }, "—");
+  const out = [];
+  ids.forEach((id, i) => {
+    if (i > 0) out.push(", ");
+    out.push(h(NodeLink, { key: id, id, onSelect }));
+  });
+  return h(Fragment, null, ...out);
+}
+
+// Collapsible <details> block with an optional count badge.
+function Collapsible({ summary, count, open, children }) {
+  return h("details", { class: "det-block", open: !!open },
+    h("summary", null,
+      h("span", { class: "det-sum-title" }, summary),
+      (count !== undefined) && h("span", { class: "det-sum-count" }, ` (${count})`),
+    ),
+    h("div", { class: "det-block-body" }, children),
+  );
+}
+
+// Render the per-component data dict. Each key gets its own collapsible
+// block; value is pretty-printed JSON. The special-cased `needs-uat` block
+// is rendered by `UatBlock`, not here.
+function ComponentDataView({ data }) {
+  const keys = Object.keys(data || {}).filter((k) => k !== "needs-uat");
+  if (keys.length === 0) return null;
+  return h(Fragment, null,
+    keys.sort().map((k) => h(Collapsible, {
+      key: k, summary: k, open: true,
+    },
+      h("pre", { class: "code-json" }, JSON.stringify(data[k], null, 2)),
+    )),
+  );
+}
+
+// UAT block — status, checklist, verifier, verified_at, notes, failure.
+function UatBlock({ uat }) {
+  if (!uat) return null;
+  const status = uat.status || "pending";
+  const crits = Array.isArray(uat.acceptance_criteria) ? uat.acceptance_criteria : [];
+  // Map UAT status -> default checkbox state. "passed" = all ticked,
+  // everything else = unticked. Read-only; mutation lives in the UAT tab.
+  const allTicked = status === "passed";
+  return h("div", { class: `uat-block uat-${status}` },
+    h("div", { class: "uat-head" },
+      h("span", { class: "uat-label" }, "UAT"),
+      h("span", { class: `status-chip ${status}` }, status),
+      uat.verified_by && h("span", { class: "muted" }, ` by ${uat.verified_by}`),
+      uat.verified_at && h("span", { class: "muted" }, ` @ ${uat.verified_at}`),
+    ),
+    crits.length > 0 && h("ul", { class: "uat-criteria" },
+      crits.map((c, i) => h("li", { key: i },
+        h("input", { type: "checkbox", checked: allTicked, disabled: true }),
+        " ", c,
+      ))),
+    uat.notes && h("div", { class: "uat-notes" }, h("span", { class: "muted" }, "notes: "), uat.notes),
+    uat.failure_reason && h("div", { class: "uat-fail" },
+      h("span", { class: "muted" }, "failure_reason: "), uat.failure_reason),
+  );
+}
+
+// Inputs panel: each input row shows from_node (as link) + artifact + kind
+// + required flag + description.
+function InputsList({ inputs, onSelect }) {
+  if (!inputs || inputs.length === 0) return h("div", { class: "muted" }, "—");
+  return h("ul", { class: "edge-list" },
+    inputs.map((i, idx) => h("li", { key: idx },
+      i.from_node
+        ? h(NodeLink, { id: i.from_node, onSelect })
+        : h("span", { class: "muted" }, "(no source)"),
+      i.artifact && h("span", null, " · ", h("code", null, i.artifact)),
+      i.kind && h("span", { class: "muted" }, ` [${i.kind}]`),
+      i.required === false && h("span", { class: "muted" }, " (optional)"),
+      i.description && h("div", { class: "muted edge-desc" }, i.description),
+    )),
+  );
+}
+
+// Outputs panel: path + kind + signal; no node-links (outputs are artifacts).
+function OutputsList({ outputs }) {
+  if (!outputs || outputs.length === 0) return h("div", { class: "muted" }, "—");
+  return h("ul", { class: "edge-list" },
+    outputs.map((o, idx) => h("li", { key: idx },
+      h("code", null, o.path || "(no path)"),
+      o.kind && h("span", { class: "muted" }, ` [${o.kind}]`),
+      o.signal && h("span", { class: "muted" }, ` · signal: ${o.signal}`),
+    )),
+  );
+}
+
+// Clickable component chips.
+function ComponentChips({ components }) {
+  if (!components || components.length === 0) return h("span", { class: "muted" }, "—");
+  return h("div", { class: "component-chips" },
+    components.map((c) => h("span", {
+      key: c,
+      class: "comp-chip",
+      style: `border-color:${colourFor(c)}; color:${colourFor(c)}`,
+    }, c)),
+  );
+}
+
+// Render markdown -> HTML via `marked`, then inject. `marked` escapes raw
+// HTML so this is safe against ordinary content; worst case a malformed
+// link renders as text.
+function Markdown({ text }) {
+  const html = useMemo(() => {
+    if (!text) return "";
+    try { return marked.parse(String(text)); }
+    catch (e) { return `<pre>${String(text)}</pre>`; }
+  }, [text]);
+  return h("div", { class: "md", dangerouslySetInnerHTML: { __html: html } });
+}
+
+// --- Detail panel -----------------------------------------------------------
+
+function Detail({ id, onSelect, onClose }) {
   const [node, setNode] = useState(null);
   const [err, setErr] = useState(null);
 
@@ -460,28 +596,82 @@ function Detail({ id, onClose }) {
   } else if (!node) {
     content = h("div", { class: "muted" }, `Loading ${id}…`);
   } else {
+    const uat = node.component_data && node.component_data["needs-uat"];
+    const hasUat = (node.components || []).includes("needs-uat") && uat;
+    // Notes: newest-first. Server stores oldest-first in the markdown log
+    // (human reads the story forward); in the panel we flip to newest-first
+    // so the *latest status* is visible without scrolling — the common
+    // "what just happened?" question when clicking a ticket.
+    const notesNewestFirst = (node.notes || []).slice().reverse();
+
     content = h(Fragment, null,
-      h("h2", null, `${node.id} — ${node.title}`),
-      h("dl", { class: "kv" },
-        h("dt", null, "status"),    h("dd", null, node.status),
-        h("dt", null, "priority"),  h("dd", null, node.priority),
-        h("dt", null, "owner"),     h("dd", null, node.owner || "—"),
-        h("dt", null, "parent"),    h("dd", null, node.parent || "—"),
-        h("dt", null, "created"),   h("dd", null, node.created),
-        h("dt", null, "updated"),   h("dd", null, node.updated),
-        h("dt", null, "components"), h("dd", null, (node.components || []).join(", ")),
-        h("dt", null, "blocks"),    h("dd", null, (node.blocks || []).join(", ") || "—"),
-        h("dt", null, "blocked_by"), h("dd", null, (node.blocked_by || []).join(", ") || "—"),
+      h("h2", null,
+        h("span", { class: "det-id" }, node.id),
+        " — ",
+        h("span", { class: "det-title" }, node.title),
       ),
-      node.body && h(Fragment, null,
+
+      // Core metadata grid.
+      h("dl", { class: "kv" },
+        h("dt", null, "status"),    h("dd", null,
+          h("span", { class: `status-chip ${node.status}` }, node.status)),
+        h("dt", null, "priority"),  h("dd", null, node.priority || "—"),
+        h("dt", null, "owner"),     h("dd", null, node.owner || "—"),
+        h("dt", null, "project"),   h("dd", null, node.project || "—"),
+        h("dt", null, "parent"),    h("dd", null,
+          node.parent ? h(NodeLink, { id: node.parent, onSelect }) : "—"),
+        h("dt", null, "created"),   h("dd", null, node.created || "—"),
+        h("dt", null, "updated"),   h("dd", null, node.updated || "—"),
+      ),
+
+      // Components as chips.
+      h("h3", null, "components"),
+      h(ComponentChips, { components: node.components }),
+
+      // UAT block — only when `needs-uat` present.
+      hasUat && h(Fragment, null,
+        h("h3", null, "UAT"),
+        h(UatBlock, { uat }),
+      ),
+
+      // Edges: inputs / outputs / blocks / blocked_by / related.
+      h("h3", null, "edges"),
+      h("div", { class: "edges" },
+        h("div", { class: "edge-group" },
+          h("div", { class: "edge-label" }, "inputs"),
+          h(InputsList, { inputs: node.inputs, onSelect })),
+        h("div", { class: "edge-group" },
+          h("div", { class: "edge-label" }, "outputs"),
+          h(OutputsList, { outputs: node.outputs })),
+        h("div", { class: "edge-group" },
+          h("div", { class: "edge-label" }, "blocks"),
+          h(NodeLinkList, { ids: node.blocks, onSelect })),
+        h("div", { class: "edge-group" },
+          h("div", { class: "edge-label" }, "blocked_by"),
+          h(NodeLinkList, { ids: node.blocked_by, onSelect })),
+        h("div", { class: "edge-group" },
+          h("div", { class: "edge-label" }, "related"),
+          h(NodeLinkList, { ids: node.related, onSelect })),
+      ),
+
+      // Per-component data (excl. needs-uat — shown above).
+      node.component_data && Object.keys(node.component_data).some((k) => k !== "needs-uat") &&
+        h(Fragment, null,
+          h("h3", null, "component_data"),
+          h(ComponentDataView, { data: node.component_data })),
+
+      // Body (markdown rendered).
+      node.body && node.body.trim() !== "" && h(Fragment, null,
         h("h3", null, "body"),
-        h("pre", null, node.body)),
+        h(Markdown, { text: node.body })),
+
+      // Notes log — newest first.
       node.notes && node.notes.length > 0 && h(Fragment, null,
-        h("h3", null, `notes (${node.notes.length})`),
-        h("pre", null, node.notes.join("\n"))),
-      node.component_data && Object.keys(node.component_data).length > 0 && h(Fragment, null,
-        h("h3", null, "component_data"),
-        h("pre", null, JSON.stringify(node.component_data, null, 2))),
+        h("h3", null, `notes (${node.notes.length}, newest first)`),
+        h("ul", { class: "notes-log" },
+          notesNewestFirst.map((entry, i) =>
+            h("li", { key: i }, h(Markdown, { text: entry })))),
+      ),
     );
   }
 
