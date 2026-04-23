@@ -17,7 +17,7 @@ query via the CLI or this library, not read `.hopewell/` files directly
 """
 from __future__ import annotations
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 SCHEMA_VERSION = "1"
 
 from hopewell.model import (

@@ -37,6 +37,46 @@ def _print_json(data: Any) -> None:
     sys.stdout.write(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
+def _render_table(headers: List[str], rows: List[List[str]], *,
+                  max_widths: Optional[List[Optional[int]]] = None) -> str:
+    """Deterministic markdown table. Cells that exceed their max width get
+    truncated with an ellipsis. `max_widths=None` means no cap for that col."""
+    if not rows:
+        widths = [len(h) for h in headers]
+    else:
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(str(cell)))
+    if max_widths:
+        for i, cap in enumerate(max_widths):
+            if cap is not None and widths[i] > cap:
+                widths[i] = cap
+
+    def trunc(s: str, w: int) -> str:
+        s = str(s)
+        if len(s) <= w:
+            return s.ljust(w)
+        return (s[: w - 1] + "…").ljust(w)
+
+    lines = [
+        "| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers)) + " |",
+        "|" + "|".join("-" * (widths[i] + 2) for i in range(len(headers))) + "|",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(trunc(row[i], widths[i]) for i in range(len(row))) + " |")
+    return "\n".join(lines)
+
+
+def _components_summary(comps: List[str], max_count: int = 3) -> str:
+    if not comps:
+        return "—"
+    head = ", ".join(comps[:max_count])
+    if len(comps) > max_count:
+        head += f" +{len(comps) - max_count}"
+    return head
+
+
 def _actor_from_env() -> Optional[str]:
     return os.environ.get("HOPEWELL_ACTOR") or os.environ.get("GIT_AUTHOR_NAME")
 
@@ -126,10 +166,17 @@ def cmd_list(args) -> int:
         _print_json(data)
     else:
         print(f"{data['count']} node(s)")
-        for n in data["nodes"]:
-            comps = ",".join(n["components"])
-            print(f"  {n['id']:12s} [{n['status']:8s}] {n['priority']} "
-                  f"{n['owner'] or '-':20s} {n['title'][:50]:50s} {comps}")
+        if data["nodes"]:
+            rows = [
+                [n["id"], n["status"], n["priority"], n["owner"] or "—",
+                 n["title"], _components_summary(n["components"])]
+                for n in data["nodes"]
+            ]
+            print(_render_table(
+                ["ID", "Status", "Pri", "Owner", "Title", "Components"],
+                rows,
+                max_widths=[10, 9, 3, 18, 55, 36],
+            ))
     return 0
 
 
@@ -140,9 +187,20 @@ def cmd_ready(args) -> int:
     if args.format == "json":
         _print_json(data)
     else:
-        print(f"{data['count']} ready node(s)")
-        for n in data["nodes"]:
-            print(f"  {n['id']:12s} {n['priority']} {n['owner'] or '-':20s} {n['title']}")
+        print(f"{data['count']} ready node(s)"
+              + (f" (excluded claimed: {', '.join(data['excluded_claimed'])})"
+                 if data.get("excluded_claimed") else ""))
+        if data["nodes"]:
+            rows = [
+                [n["id"], n["priority"], n["owner"] or "—",
+                 n["title"], _components_summary(n["components"])]
+                for n in data["nodes"]
+            ]
+            print(_render_table(
+                ["ID", "Pri", "Owner", "Title", "Components"],
+                rows,
+                max_widths=[10, 3, 18, 60, 36],
+            ))
     return 0
 
 
