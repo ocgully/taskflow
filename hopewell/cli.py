@@ -18,6 +18,7 @@ from hopewell import hooks as hooks_mod
 from hopewell import merge_driver as merge_driver_mod
 from hopewell import paths as paths_mod
 from hopewell import resume as resume_mod
+from hopewell import uat as uat_mod
 from hopewell.model import EdgeKind, NodeStatus
 
 
@@ -276,6 +277,91 @@ def cmd_prune_claims(args) -> int:
 def cmd_merge_driver(args) -> int:
     # Invoked by git: `hopewell merge-driver jsonl <ancestor> <ours> <theirs>`
     return merge_driver_mod.run_cli([args.kind, args.ancestor, args.ours, args.theirs])
+
+
+def cmd_uat(args) -> int:
+    project = _project(args)
+    actor = _actor_from_env()
+
+    if args.action == "flag":
+        criteria = [c for c in (args.criteria or []) if c.strip()]
+        block = uat_mod.flag(project, args.id, acceptance_criteria=criteria or None, actor=actor)
+        _print_json({"node": args.id, "uat": block})
+        return 0
+
+    if args.action == "unflag":
+        uat_mod.unflag(project, args.id, actor=actor, reason=args.reason)
+        if not args.quiet:
+            print(f"unflagged {args.id}")
+        return 0
+
+    if args.action in ("pass", "fail", "waive"):
+        status_map = {"pass": uat_mod.STATUS_PASSED,
+                      "fail": uat_mod.STATUS_FAILED,
+                      "waive": uat_mod.STATUS_WAIVED}
+        block = uat_mod.mark(
+            project, args.id, status_map[args.action],
+            verified_by=args.verified_by or actor,
+            notes=args.notes, failure_reason=args.reason, actor=actor,
+        )
+        if args.format == "json":
+            _print_json({"node": args.id, "uat": block})
+        else:
+            print(f"{args.id} UAT {status_map[args.action]}" +
+                  (f" — {args.reason}" if args.reason else ""))
+        return 0
+
+    if args.action == "list":
+        status = args.status or "pending"
+        rows = uat_mod.list_uat(project, status=status)
+        if args.format == "json":
+            _print_json({"uat_status_filter": status, "count": len(rows), "items": rows})
+        else:
+            if not rows:
+                print(f"no UAT items with status={status}")
+                return 0
+            print(f"UAT {status} — {len(rows)} item(s):\n")
+            for r in rows:
+                print(f"  {r['id']:10} [{r['uat_status']:7}] {r['title']}")
+                if r.get("acceptance_criteria"):
+                    for c in r["acceptance_criteria"][:6]:
+                        print(f"    - {c}")
+                if r.get("failure_reason"):
+                    print(f"    FAILURE: {r['failure_reason']}")
+                if r.get("verified_by"):
+                    print(f"    verified by {r['verified_by']} @ {r.get('verified_at', '?')}")
+                print(f"    pass:  hopewell uat pass  {r['id']} [--notes \"...\"]")
+                print(f"    fail:  hopewell uat fail  {r['id']} --reason \"...\"")
+                print(f"    waive: hopewell uat waive {r['id']} --reason \"...\"")
+                print()
+        return 0
+
+    if args.action == "show":
+        rows = [r for r in uat_mod.list_uat(project, status="all") if r["id"] == args.id]
+        if not rows:
+            print(f"hopewell: {args.id} has no needs-uat component", file=sys.stderr)
+            return 1
+        _print_json(rows[0])
+        return 0
+
+    if args.action == "backfill":
+        has_all = [c.strip() for c in (args.has_all or "").split(",") if c.strip()]
+        touched = uat_mod.backfill(
+            project,
+            node_status=args.status, component=args.component,
+            has_all=has_all or None, since=args.since,
+            dry_run=args.dry_run, actor=actor,
+        )
+        if args.format == "json":
+            _print_json({"dry_run": args.dry_run, "count": len(touched), "touched": touched})
+        else:
+            print(("would flag" if args.dry_run else "flagged") + f" {len(touched)} node(s):")
+            for r in touched:
+                print(f"  {r['id']:10} [{r['node_status']}] {r['title']}")
+        return 0
+
+    print(f"hopewell: unknown uat action '{args.action}'", file=sys.stderr)
+    return 1
 
 
 def cmd_resume(args) -> int:
@@ -726,6 +812,38 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--next", required=True, help="Brief description of the next step")
     sp.add_argument("--quiet", action="store_true")
     sp.set_defaults(func=cmd_checkpoint)
+
+    # uat — User-Acceptance Testing tracking (v0.5.4)
+    sp = sub.add_parser("uat", help="User-acceptance testing: flag/list/pass/fail/waive/backfill")
+    sp.add_argument("action",
+                    choices=["flag", "unflag", "list", "show", "pass", "fail", "waive", "backfill"])
+    sp.add_argument("id", nargs="?", default=None)
+    # flag
+    sp.add_argument("--criteria", action="append", default=None,
+                    help="(flag) Acceptance-criteria bullet; repeat to add multiple")
+    # mark
+    sp.add_argument("--notes", default=None, help="(pass/fail/waive) Free-form notes from the verifier")
+    sp.add_argument("--reason", default=None,
+                    help="(fail/waive/unflag) Required rationale")
+    sp.add_argument("--verified-by", default=None,
+                    help="(pass/fail/waive) Override verifier identity (defaults to $HOPEWELL_ACTOR)")
+    # list
+    sp.add_argument("--status", default=None,
+                    choices=["pending", "passed", "failed", "waived", "all", "any",
+                             "idea", "blocked", "ready", "doing", "review", "done",
+                             "archived", "cancelled"],
+                    help="(list) UAT status filter (default: pending). (backfill) node-status filter.")
+    # backfill
+    sp.add_argument("--component", default=None,
+                    help="(backfill) Only flag nodes carrying this component")
+    sp.add_argument("--has-all", default=None,
+                    help="(backfill) Comma-separated component list; all must be present")
+    sp.add_argument("--since", default=None, help="(backfill) ISO-8601 timestamp")
+    sp.add_argument("--dry-run", action="store_true", help="(backfill) Report what would be flagged; don't mutate")
+    # common
+    sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=cmd_uat)
 
     # query
     sp = sub.add_parser("query", help="Read-only JSON queries")

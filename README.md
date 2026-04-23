@@ -174,6 +174,79 @@ audit `project.migrate` entry in `events.jsonl`.
 it won't add a duplicate `project.init` event — but `migrate` is the
 named command for the intent.
 
+## UAT — user-acceptance testing
+
+Internal tests passing isn't always enough. Some work needs a human to
+verify against acceptance criteria before it's truly shipped. The
+`needs-uat` component flags those nodes; Hopewell tracks pending /
+passed / failed / waived outcomes separately from the node's primary
+status.
+
+```bash
+# Flag at creation or retroactively
+hopewell uat flag HW-0042
+hopewell uat flag HW-0042 --criteria "handles 1000 entities" \
+                          --criteria "no frame drops on VR target"
+
+# List what's pending (default) — emits pass/fail/waive commands inline
+hopewell uat list
+hopewell uat list --status failed
+hopewell uat list --status all
+
+# Record outcomes
+hopewell uat pass  HW-0042 --notes "verified on Quest 3, 60fps stable"
+hopewell uat fail  HW-0042 --reason "dropped frames under 50 entities; needs batching"
+hopewell uat waive HW-0042 --reason "internal tooling — developer-only, no end-user impact"
+
+# Show one node's UAT state
+hopewell uat show HW-0042
+
+# Remove UAT flag entirely (rare — for 'never actually needed UAT' cases)
+hopewell uat unflag HW-0042 --reason "..."
+```
+
+### Retroactive backfill
+
+If a project realises after-the-fact that UAT tracking was missing (the
+common Gulliver-style scenario: every done node got shipped with no
+explicit verification), `hopewell uat backfill` adds `needs-uat=pending`
+to every node matching a filter:
+
+```bash
+# Every done node gets flagged as needing UAT
+hopewell uat backfill --status done
+
+# Only done nodes with the `user-facing` component (skip internal tooling)
+hopewell uat backfill --status done --has-all user-facing
+
+# Since a specific date
+hopewell uat backfill --status done --since 2026-04-01
+
+# Preview before touching anything
+hopewell uat backfill --status done --dry-run
+```
+
+Backfill never overrides an explicit UAT decision — nodes already
+carrying `needs-uat` (even with status=waived) are left alone.
+
+### Views
+
+`.hopewell/views/UAT.md` regenerates on every `hopewell render`. Four
+sections: pending / failed / passed / waived, each listing nodes with
+their acceptance criteria as checkbox bullets + the exact CLI commands
+to mark outcomes. Human-browsable; also great for a review session
+where you walk a list item-by-item.
+
+### State-machine semantics
+
+UAT status is **orthogonal** to node status. A node can be `done` with
+UAT `pending` — that's the "shipped internally but not yet verified
+with the end user" state. The `done` state machine transition is
+unchanged; UAT is a separate axis. A `uat fail` outcome does NOT
+auto-reopen the node (that's a follow-up decision for the owner —
+reopen via `hopewell set-status HW-NNNN doing`, or waive with a
+rationale, or ticket the fix as a new node).
+
 ## Session resume — picking up mid-work
 
 Agents and humans regularly leave work mid-stream: a Claude Code
@@ -514,6 +587,14 @@ hopewell orch {plan|run|status} [--dry-run] [--max N]
 # v0.5.3 session-resume
 hopewell resume [@name] [--all] [--format text|json]
 hopewell checkpoint <id> --next "..."
+
+# v0.5.4 UAT tracking
+hopewell uat flag <id> [--criteria "..."]
+hopewell uat {pass|fail|waive} <id> [--notes "..."] [--reason "..."]
+hopewell uat list [--status pending|passed|failed|waived|all]
+hopewell uat show <id>
+hopewell uat backfill [--status done] [--has-all user-facing,...] [--dry-run]
+hopewell uat unflag <id> --reason "..."
 
 hopewell github {sync|pull|config} [ref] [--since <ts>] [--state open|closed|all]
 

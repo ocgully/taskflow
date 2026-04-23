@@ -5,7 +5,7 @@ outputs regenerate from the node files + events; never hand-edited.
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from hopewell.model import Node, NodeStatus, TERMINAL_STATUSES
 from hopewell.project import Project
@@ -18,10 +18,70 @@ def render_all(project: Project) -> Dict[str, str]:
         "BACKLOG.md": backlog(nodes, project),
         "graph.md": graph(nodes),
         "metrics.md": metrics(nodes),
+        "UAT.md": uat_view(project),
     }
     for name, content in out.items():
         (project.views_dir / name).write_text(content, encoding="utf-8")
     return out
+
+
+def uat_view(project: Project) -> str:
+    """Render the UAT status view — grouped by uat_status."""
+    from hopewell import uat as uat_mod
+    all_items = uat_mod.list_uat(project, status="all")
+    by_status: Dict[str, List[Dict[str, Any]]] = {}
+    for r in all_items:
+        by_status.setdefault(r["uat_status"], []).append(r)
+
+    lines: List[str] = [
+        f"# UAT — User-Acceptance Testing",
+        "",
+        f"_Generated from `.hopewell/nodes/*.md` — edit via `hopewell uat ...`, not this file._",
+        "",
+        f"Total UAT-flagged nodes: **{len(all_items)}**",
+    ]
+    counts = {s: len(by_status.get(s, [])) for s in ("pending", "failed", "passed", "waived")}
+    lines.append(f"- pending: {counts['pending']}  |  failed: {counts['failed']}  "
+                 f"|  passed: {counts['passed']}  |  waived: {counts['waived']}")
+    lines.append("")
+
+    for status_label, header in [("pending", "🟡 Pending UAT"),
+                                 ("failed", "🔴 Failed UAT"),
+                                 ("passed", "✅ Passed UAT"),
+                                 ("waived", "⚪ Waived")]:
+        rows = by_status.get(status_label, [])
+        if not rows:
+            continue
+        lines.append(f"## {header} ({len(rows)})")
+        lines.append("")
+        for r in rows:
+            lines.append(f"### {r['id']} — {r['title']}")
+            lines.append(f"**Node status**: `{r['node_status']}`   **Owner**: {r['owner'] or '—'}")
+            if r.get("acceptance_criteria"):
+                lines.append("**Acceptance criteria**:")
+                for c in r["acceptance_criteria"]:
+                    lines.append(f"- [ ] {c}")
+            if r.get("verified_by"):
+                lines.append(f"**Verified by**: {r['verified_by']} @ {r.get('verified_at', '?')}")
+            if r.get("notes"):
+                lines.append(f"**Notes**: {r['notes']}")
+            if r.get("failure_reason"):
+                lines.append(f"**Failure reason**: {r['failure_reason']}")
+            if status_label == "pending":
+                lines.append("")
+                lines.append("```bash")
+                lines.append(f"hopewell uat pass  {r['id']} --notes \"...\"")
+                lines.append(f"hopewell uat fail  {r['id']} --reason \"...\"")
+                lines.append(f"hopewell uat waive {r['id']} --reason \"...\"")
+                lines.append("```")
+            lines.append("")
+
+    if not all_items:
+        lines.append("_No UAT-flagged nodes yet._  "
+                     "Flag a node with `hopewell uat flag <id>` or backfill "
+                     "with `hopewell uat backfill --status done`.")
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def backlog(nodes: List[Node], project: Project) -> str:

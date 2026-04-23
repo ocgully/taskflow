@@ -204,6 +204,20 @@ BUILTIN_COMPONENTS: List[Component] = [
         schema={"repo": "string", "number": "integer", "url": "string", "gh_state": "string"},
         required_fields=["repo", "number"],
     ),
+    Component(
+        name="needs-uat",
+        description=("Requires user-acceptance testing. Internal tests passing "
+                     "is not sufficient; a human has to verify against "
+                     "acceptance criteria before this node is truly shipped."),
+        schema={
+            "status": "enum: pending | passed | failed | waived",
+            "acceptance_criteria": "array of strings",
+            "verified_by": "string (agent or human name)",
+            "verified_at": "iso-ts",
+            "notes": "string",
+            "failure_reason": "string",
+        },
+    ),
 ]
 
 
