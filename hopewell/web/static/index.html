@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hopewell</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>Hopewell <span id="project-name" class="muted"></span></h1>
+    <nav class="tabs">
+      <button class="tab active" data-tab="tree">Tree</button>
+      <button class="tab" data-tab="canvas">Canvas</button>
+      <button class="tab" data-tab="timeline">Timeline</button>
+      <button class="tab" data-tab="uat">UAT</button>
+    </nav>
+    <div class="right">
+      <span id="status-dot" class="dot" title="SSE disconnected"></span>
+      <span id="metric-total" class="metric">0 nodes</span>
+      <button id="refresh">Refresh</button>
+    </div>
+  </header>
+  <main id="app"></main>
+  <aside id="detail" class="detail hidden">
+    <button class="close" id="detail-close" aria-label="close">x</button>
+    <div id="detail-body"></div>
+  </aside>
+  <footer class="bottom">
+    <span id="last-event" class="muted">no events yet</span>
+  </footer>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
