@@ -18,6 +18,7 @@ from hopewell import evolve as evolve_mod
 from hopewell import extensions as extensions_mod
 from hopewell import hooks as hooks_mod
 from hopewell import merge_driver as merge_driver_mod
+from hopewell import network_cli as network_cli_mod
 from hopewell import paths as paths_mod
 from hopewell import resume as resume_mod
 from hopewell import uat as uat_mod
@@ -1010,6 +1011,50 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--open", dest="open_browser", action="store_true",
                     help="Open in the default browser on start")
     sp.set_defaults(func=cmd_web)
+
+    # network — flow-network executors + routes (HW-0027)
+    sp = sub.add_parser("network", help="Flow-network: executors + routes (v0.7)")
+    nsub = sp.add_subparsers(dest="network_cmd", required=True)
+
+    np = nsub.add_parser("init", help="Scaffold .hopewell/network/")
+    np.add_argument("--quiet", action="store_true")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_init(a))
+
+    np = nsub.add_parser("defaults", help="Default-template ops")
+    np.add_argument("action", choices=["bootstrap"])
+    np.add_argument("--quiet", action="store_true")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_defaults(a))
+
+    np = nsub.add_parser("executor", help="executor add/rm/show/list")
+    np.add_argument("action", choices=["add", "rm", "show", "list"])
+    np.add_argument("id", nargs="?")
+    np.add_argument("--components", default=None,
+                    help="(add) comma-separated component list")
+    np.add_argument("--component-data", default=None,
+                    help="(add) JSON-encoded dict keyed by component name")
+    np.add_argument("--parent", default=None,
+                    help="(add) parent group executor id")
+    np.add_argument("--label", default=None, help="(add) human display label")
+    np.add_argument("--format", choices=["text", "json"], default="text")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_executor(a))
+
+    np = nsub.add_parser("route", help="route add/rm/list")
+    np.add_argument("action", choices=["add", "rm", "list"])
+    np.add_argument("from_id", nargs="?")
+    np.add_argument("to", nargs="?")
+    np.add_argument("--condition", default=None)
+    np.add_argument("--label", default=None)
+    np.add_argument("--required", action="store_true")
+    np.add_argument("--format", choices=["text", "json"], default="text")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_route(a))
+
+    np = nsub.add_parser("show", help="Full flow-network render")
+    np.add_argument("--format", choices=["text", "json", "mermaid"], default="text")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_show(a))
+
+    np = nsub.add_parser("validate", help="Run validation rules")
+    np.add_argument("--format", choices=["text", "json"], default="text")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_validate(a))
 
     # resume + checkpoint (v0.5.3 session-resume protocol)
     sp = sub.add_parser("resume", help="Show your active work + where you left off on each node")
