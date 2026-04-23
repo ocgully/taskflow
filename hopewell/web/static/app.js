@@ -88,7 +88,7 @@ function dominantComponent(n) {
 
 function App() {
   const [state, setState] = useState(EMPTY_STATE);
-  const [tab, setTab] = useState("tree");
+  const [tab, setTab] = useState("backlog");
   const [detailId, setDetailId] = useState(null);
   const [sseOk, setSseOk] = useState(false);
   const [lastEvent, setLastEvent] = useState("no events yet");
@@ -161,7 +161,7 @@ function App() {
 
   return h(Fragment, null,
     error && h("div", { class: "empty" }, `Error loading state: ${error}`),
-    tab === "tree"     && h(TreeView,     { state, onSelect }),
+    tab === "backlog"  && h(BacklogView,  { state, onSelect }),
     tab === "canvas"   && h(CanvasView,   { state, onSelect }),
     tab === "timeline" && h(TimelineView, { state, onSelect }),
     tab === "uat"      && h(UatView,      { state, onSelect, reload }),
@@ -174,30 +174,70 @@ function App() {
 }
 
 // ---------------------------------------------------------------------------
-// Tree view
+// Backlog view — dependency DAG resolved into execution waves.
+//
+// Philosophy (HW-0024): a developer asking "what's next?" wants to see
+// wave 0 at the top (no live blockers), wave 1 underneath, and so on.
+// Parent edges still group sub-work: an epic appears at the wave where
+// it itself sits and offers a "▼ N children" toggle to expand children
+// *regardless of which wave those children live in* — parent grouping
+// is orthogonal to wave ordering.
+//
+// Excluded nodes (cycles, unsatisfiable deps) surface in a visually
+// distinct section at the bottom so they can't hide.
 // ---------------------------------------------------------------------------
 
-function TreeView({ state, onSelect }) {
+function BacklogView({ state, onSelect }) {
   const [collapsed, setCollapsed] = useState(() => new Set());
 
+  // Index nodes + attach children = nodes whose `parent` points here.
+  // We keep the raw node fields; only `children` is synthesised.
   const byId = useMemo(() => {
     const m = new Map();
     for (const n of state.nodes) m.set(n.id, { ...n, children: [] });
+    for (const n of m.values()) {
+      if (n.parent && m.has(n.parent)) m.get(n.parent).children.push(n);
+    }
+    for (const n of m.values()) {
+      n.children.sort((a, b) => a.id.localeCompare(b.id));
+    }
     return m;
   }, [state.nodes]);
 
-  const roots = useMemo(() => {
-    const rs = [];
-    for (const n of byId.values()) {
-      if (n.parent && byId.has(n.parent)) byId.get(n.parent).children.push(n);
-      else rs.push(n);
+  // Owner-by-node from the active claims stream (shown as a badge).
+  const claimByNode = useMemo(() => {
+    const m = new Map();
+    for (const c of state.claims || []) {
+      if (!m.has(c.node_id)) m.set(c.node_id, c.claimer || "claimed");
     }
-    // Stable ordering: by id.
-    const sortRec = (n) => { n.children.sort((a, b) => a.id.localeCompare(b.id)); n.children.forEach(sortRec); };
-    rs.sort((a, b) => a.id.localeCompare(b.id));
-    rs.forEach(sortRec);
-    return rs;
-  }, [byId]);
+    return m;
+  }, [state.claims]);
+
+  // UAT status by node — only populated for `needs-uat` nodes.
+  const uatByNode = useMemo(() => {
+    const m = new Map();
+    for (const u of state.uat || []) m.set(u.id, u.uat_status);
+    return m;
+  }, [state.uat]);
+
+  // The scheduler already returns waves sorted by (priority, id) and
+  // excludes terminals. We just consume its output.
+  const wavesPayload = state.waves || { waves: [], critical_path: [], excluded: [] };
+  const waves = wavesPayload.waves || [];
+  const excluded = wavesPayload.excluded || [];
+  const critical = useMemo(() => new Set(wavesPayload.critical_path || []),
+                           [wavesPayload.critical_path]);
+
+  // Which node ids the scheduler actually placed? Used to decide whether
+  // a child node shown under its parent is "done/archived" vs still in a
+  // future wave. Terminal ids come from `already_done`.
+  const terminalIds = useMemo(() => new Set(wavesPayload.already_done || []),
+                              [wavesPayload.already_done]);
+  const placedWave = useMemo(() => {
+    const m = new Map();
+    for (const w of waves) for (const id of w.nodes) m.set(id, w.n);
+    return m;
+  }, [waves]);
 
   const toggle = (id) => {
     setCollapsed((prev) => {
@@ -210,27 +250,82 @@ function TreeView({ state, onSelect }) {
   if (state.nodes.length === 0) {
     return h("div", { class: "empty" }, "No nodes. Create some with `hopewell new`.");
   }
+  if (waves.length === 0 && excluded.length === 0) {
+    return h("div", { class: "empty" },
+      "Nothing to schedule — every node is already terminal (done/archived/cancelled).");
+  }
 
-  const renderNode = (n) => {
-    const isLeaf = n.children.length === 0;
-    const isCollapsed = collapsed.has(n.id);
-    return h("li", { key: n.id },
-      h("div", { class: "row" },
+  // Render one node row. `depth` is parent-nesting indent (0 = top of a wave).
+  // A node expanded here shows its children below it indented, regardless
+  // of what wave those children themselves belong to.
+  const renderRow = (id, depth) => {
+    const n = byId.get(id);
+    if (!n) {
+      // Referenced but no graph entry — still surface it so it can't hide.
+      return h("li", { key: id, class: "bl-row missing" },
+        h("span", { class: "bl-caret leaf" }),
+        h("span", { class: "bl-id", onClick: () => onSelect(id) }, id),
+        h("span", { class: "bl-title muted" }, " (unknown node)"),
+      );
+    }
+    const kids = n.children || [];
+    const hasKids = kids.length > 0;
+    const isCollapsed = collapsed.has(id);
+    const owner = claimByNode.get(id) || n.owner || null;
+    const uat = uatByNode.get(id);
+    const onCrit = critical.has(id);
+
+    return h("li", { key: id, class: "bl-row" + (depth > 0 ? " child" : "") },
+      h("div", {
+        class: "bl-line" + (onCrit ? " on-critical" : ""),
+        style: depth ? `padding-left:${depth * 16}px` : "",
+      },
         h("span", {
-          class: "caret" + (isLeaf ? " leaf" : ""),
-          onClick: () => !isLeaf && toggle(n.id),
-        }, isLeaf ? "" : (isCollapsed ? "▸" : "▾")),
-        h("span", { class: "id", onClick: () => onSelect(n.id) }, n.id),
-        h("span", { class: "title", onClick: () => onSelect(n.id) }, " " + n.title),
+          class: "bl-caret" + (hasKids ? "" : " leaf"),
+          onClick: () => hasKids && toggle(id),
+          title: hasKids ? `${kids.length} child${kids.length === 1 ? "" : "ren"}` : "",
+        }, hasKids ? (isCollapsed ? "▸" : "▾") : ""),
+        h("span", { class: "bl-id", onClick: () => onSelect(id) }, id),
+        h("span", { class: "bl-title", onClick: () => onSelect(id) }, " " + n.title),
+        hasKids && h("span", { class: "bl-kidcount muted" },
+          ` ${kids.length} child${kids.length === 1 ? "" : "ren"}`),
         h("span", { class: `badge status-${n.status}` }, n.status),
         n.priority && h("span", { class: "badge" }, n.priority),
+        owner && h("span", { class: "badge owner", title: claimByNode.has(id) ? "currently claimed" : "owner" },
+          "@" + String(owner).replace(/^@/, "")),
+        uat && h("span", { class: `badge uat uat-${uat}` }, `uat:${uat}`),
+        onCrit && h("span", { class: "badge crit", title: "on critical path" }, "critical"),
       ),
-      !isLeaf && !isCollapsed && h("ul", null, n.children.map(renderNode)),
+      hasKids && !isCollapsed && h("ul", { class: "bl-children" },
+        kids.map((c) => renderRow(c.id, depth + 1))),
     );
   };
 
-  return h("div", { class: "tree" },
-    h("ul", null, roots.map(renderNode)),
+  return h("div", { class: "backlog" },
+    h("div", { class: "muted bl-summary" },
+      `${waves.length} wave${waves.length === 1 ? "" : "s"}`
+      + `, depth ${wavesPayload.depth || waves.length}`
+      + `, max width ${wavesPayload.max_width || 0}`
+      + (wavesPayload.critical_path && wavesPayload.critical_path.length
+          ? `, critical path: ${wavesPayload.critical_path.join(" → ")}`
+          : "")),
+    waves.map((w) => h("section", { key: `w${w.n}`, class: "bl-wave" },
+      h("h3", null,
+        h("span", { class: "bl-wave-n" }, `Wave ${w.n}`),
+        h("span", { class: "muted" }, ` · ${w.nodes.length} node${w.nodes.length === 1 ? "" : "s"}`),
+        w.n === 0 && h("span", { class: "muted bl-wave-hint" }, " · ready to start"),
+      ),
+      h("ul", { class: "bl-list" }, w.nodes.map((id) => renderRow(id, 0))),
+    )),
+    excluded.length > 0 && h("section", { class: "bl-wave bl-excluded" },
+      h("h3", null,
+        h("span", { class: "bl-wave-n" }, "Excluded"),
+        h("span", { class: "muted" }, ` · ${excluded.length} node${excluded.length === 1 ? "" : "s"}`),
+        h("span", { class: "muted bl-wave-hint" },
+          " · cycle or unsatisfiable dependency — cannot schedule"),
+      ),
+      h("ul", { class: "bl-list" }, excluded.map((id) => renderRow(id, 0))),
+    ),
   );
 }
 

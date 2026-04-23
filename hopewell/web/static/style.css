@@ -102,31 +102,74 @@ footer.bottom {
   color: var(--fg-muted);
 }
 
-/* ---- Tree ---- */
+/* ---- Backlog (wave-resolved DAG with parent grouping) ---- */
 
-.tree ul { list-style: none; padding-left: 16px; margin: 2px 0; }
-.tree > ul { padding-left: 0; }
-.tree li { margin: 2px 0; }
-.tree .row {
-  display: inline-flex;
+.backlog { display: flex; flex-direction: column; gap: 8px; }
+.bl-summary { font-size: 11px; margin-bottom: 2px; }
+
+.bl-wave {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px 8px 10px;
+}
+.bl-wave h3 {
+  margin: 0 0 6px 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+}
+.bl-wave-n { color: var(--fg); font-weight: 600; font-family: ui-monospace, monospace; }
+.bl-wave-hint { font-style: italic; }
+.bl-excluded { border-color: rgba(255, 107, 107, 0.45); }
+.bl-excluded h3 .bl-wave-n { color: var(--err); }
+
+.bl-list, .bl-children {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.bl-children { margin-top: 1px; }
+
+.bl-row.missing .bl-id { color: var(--err); }
+
+.bl-line {
+  display: flex;
   align-items: center;
   gap: 6px;
   padding: 2px 6px;
   border-radius: 4px;
   cursor: pointer;
 }
-.tree .row:hover { background: var(--bg-3); }
-.tree .caret {
+.bl-line:hover { background: var(--bg-3); }
+.bl-line.on-critical {
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+.bl-caret {
   display: inline-block;
   width: 10px;
   color: var(--fg-muted);
   font-size: 10px;
   user-select: none;
+  text-align: center;
 }
-.tree .caret.leaf { visibility: hidden; }
-.tree .id { color: var(--accent); font-family: ui-monospace, monospace; }
-.tree .title { }
-.tree .badge {
+.bl-caret.leaf { visibility: hidden; }
+.bl-id {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+}
+.bl-title { }
+.bl-kidcount { font-size: 10px; font-style: italic; }
+
+/* Shared badge look (reused by Backlog rows). */
+.bl-line .badge {
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 8px;
@@ -134,13 +177,19 @@ footer.bottom {
   border: 1px solid var(--border);
   color: var(--fg-muted);
 }
-.tree .badge.status-done { color: var(--ok); border-color: rgba(91, 212, 155, 0.35); }
-.tree .badge.status-doing { color: var(--warn); border-color: rgba(245, 181, 86, 0.35); }
-.tree .badge.status-review { color: var(--accent); border-color: rgba(110, 168, 255, 0.35); }
-.tree .badge.status-blocked { color: var(--err); border-color: rgba(255, 107, 107, 0.35); }
-.tree .badge.status-ready { color: var(--accent-2); border-color: rgba(161, 122, 255, 0.35); }
-.tree .badge.status-cancelled,
-.tree .badge.status-archived { color: var(--fg-muted); }
+.bl-line .badge.status-done { color: var(--ok); border-color: rgba(91, 212, 155, 0.35); }
+.bl-line .badge.status-doing { color: var(--warn); border-color: rgba(245, 181, 86, 0.35); }
+.bl-line .badge.status-review { color: var(--accent); border-color: rgba(110, 168, 255, 0.35); }
+.bl-line .badge.status-blocked { color: var(--err); border-color: rgba(255, 107, 107, 0.35); }
+.bl-line .badge.status-ready { color: var(--accent-2); border-color: rgba(161, 122, 255, 0.35); }
+.bl-line .badge.status-cancelled,
+.bl-line .badge.status-archived { color: var(--fg-muted); }
+.bl-line .badge.owner { color: var(--accent); border-color: rgba(110, 168, 255, 0.35); }
+.bl-line .badge.uat.uat-pending { color: var(--warn); border-color: rgba(245, 181, 86, 0.35); }
+.bl-line .badge.uat.uat-passed  { color: var(--ok);   border-color: rgba(91, 212, 155, 0.35); }
+.bl-line .badge.uat.uat-failed  { color: var(--err);  border-color: rgba(255, 107, 107, 0.35); }
+.bl-line .badge.uat.uat-waived  { color: var(--fg-muted); }
+.bl-line .badge.crit { color: var(--warn); border-color: rgba(245, 181, 86, 0.55); }
 
 /* ---- Canvas ---- */
 
