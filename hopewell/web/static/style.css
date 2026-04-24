@@ -236,6 +236,11 @@ footer.bottom {
 .fx-rf-node.fx-highlighted {
   filter: drop-shadow(0 0 6px #ffffff) brightness(1.15);
 }
+/* Edge-hover endpoint glow — applied via direct DOM classList toggling
+ * on the outer React Flow node wrapper (avoids React state roundtrip). */
+.fx-canvas .react-flow__node.fx-edge-endpoint .fx-rf-node {
+  filter: drop-shadow(0 0 6px #ffffff) brightness(1.15);
+}
 .fx-rf-label {
   flex: 1;
   font-weight: 500;

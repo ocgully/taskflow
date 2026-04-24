@@ -540,16 +540,29 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
                        journey, error }) {
   const [selected, setSelected] = useState(null);
   const [tickFrame, setTickFrame] = useState(0);
-  const [hoveredEdge, setHoveredEdge] = useState(null);   // "from|to" key or null
   const rf = useReactFlow();
 
-  // Endpoints of the currently-hovered edge — used to light up the
-  // source and target nodes when mousing over a connection.
-  const hoverEndpoints = useMemo(() => {
-    if (!hoveredEdge) return new Set();
-    const [from, to] = hoveredEdge.split("|");
-    return new Set([from, to]);
-  }, [hoveredEdge]);
+  // Edge-hover highlight is applied via direct DOM classList toggling,
+  // NOT React state. Reason: a state-driven version (setHoveredEdge ->
+  // memo invalidation -> rfNodes rebuild -> ReactFlow store update
+  // -> useReactFlow() subscription re-render -> cascade) caused the
+  // canvas to flicker. DOM toggling sidesteps the render cascade
+  // entirely — pure visual change, zero React work.
+  const onEdgeMouseEnter = useCallback((_e, edge) => {
+    const key = edge?.data?.key;
+    if (!key) return;
+    const [from, to] = key.split("|");
+    document.querySelectorAll(".react-flow__node.fx-edge-endpoint")
+      .forEach((el) => el.classList.remove("fx-edge-endpoint"));
+    const q = (id) => document.querySelector(
+      `.fx-canvas .react-flow__node[data-id="${CSS.escape(id)}"]`);
+    q(from)?.classList.add("fx-edge-endpoint");
+    q(to)?.classList.add("fx-edge-endpoint");
+  }, []);
+  const onEdgeMouseLeave = useCallback(() => {
+    document.querySelectorAll(".fx-canvas .react-flow__node.fx-edge-endpoint")
+      .forEach((el) => el.classList.remove("fx-edge-endpoint"));
+  }, []);
 
   // Journey highlight sets.
   const journeyEdges = useMemo(() => {
@@ -580,7 +593,6 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
 
   // Build React Flow nodes from network + layout.
   const rfNodes = useMemo(() => {
-    if (typeof console !== "undefined") console.count("rfNodes rebuild");
     if (!network || !layout) return [];
     return network.executors.map((ex) => {
       const pos = layout.positions[ex.id] || { x: 0, y: 0, width: 180, height: 52 };
@@ -600,11 +612,11 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
           saturation: activityByExec.sat[ex.id] || 0.2,
           depth: slot.inbox_depth || 0,
           active: slot.active_depth || 0,
-          highlighted: journeyNodes.has(ex.id) || hoverEndpoints.has(ex.id),
+          highlighted: journeyNodes.has(ex.id),
         },
       };
     });
-  }, [network, layout, packets, activityByExec, journeyNodes, hoverEndpoints]);
+  }, [network, layout, packets, activityByExec, journeyNodes]);
 
   // Build React Flow edges from routes.
   //
@@ -821,8 +833,8 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       selectNodesOnDrag: false,
       onNodeClick,
       onEdgeClick,
-      onEdgeMouseEnter: (_e, edge) => setHoveredEdge(edge.data?.key || null),
-      onEdgeMouseLeave: () => setHoveredEdge(null),
+      onEdgeMouseEnter,
+      onEdgeMouseLeave,
       onPaneClick,
       fitView: true,
       fitViewOptions: { padding: 0.1 },
