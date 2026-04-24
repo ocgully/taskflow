@@ -129,6 +129,26 @@ function sizeFor(kind, label) {
   }
 }
 
+// Deterministic unique color per executor id. Hashes id to an HSL hue
+// and uses golden-ratio-conjugate mixing to ensure visually distinct
+// colors across arbitrary numbers of agents (no "next available slot"
+// limit — 20 agents are all far apart on the wheel).
+function hueForId(id) {
+  let h = 2166136261 >>> 0;
+  const s = String(id || "");
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  }
+  const unit = (h >>> 0) / 4294967295;
+  return Math.floor((unit + 0.618033988749895) * 360) % 360;
+}
+function uniqueColorFor(id) {
+  return `hsl(${hueForId(id)}, 70%, 65%)`;
+}
+function uniqueColorDimFor(id) {
+  return `hsl(${hueForId(id)}, 55%, 50%)`;
+}
+
 // Tint base-color by saturation (0..1) toward --bg-3.
 function mixWithBg(hex, sat) {
   const s = Math.max(0, Math.min(1, sat || 0.2));
@@ -174,6 +194,7 @@ function AgentNode({ data, selected }) {
   const { executor, saturation, depth, active, width, height, highlighted } = data;
   const { base, accent } = hueFor("agent");
   const fill = mixWithBg(base, saturation);
+  const uniqueColor = uniqueColorFor(executor.id);
   const stroke = selected || highlighted ? "#ffffff" : accent;
   const total = (depth || 0) + (active || 0);
   return h("div", {
@@ -191,7 +212,7 @@ function AgentNode({ data, selected }) {
     },
   },
     h("div", { class: "fx-rf-avatar",
-      style: { borderColor: accent, color: accent } },
+      style: { borderColor: uniqueColor, color: uniqueColor, borderWidth: "2px" } },
       initials(executor.id)),
     h("div", { class: "fx-rf-label" }, executor.label || executor.id),
     total > 0 && h("div", { class: "fx-rf-badge" }, String(total)),
@@ -405,10 +426,12 @@ async function computeLayout(executors, routes) {
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "90",
-      "elk.layered.spacing.edgeNodeBetweenLayers": "40",
-      "elk.spacing.nodeNode": "32",
-      "elk.spacing.edgeNode": "18",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "140",
+      "elk.layered.spacing.edgeNodeBetweenLayers": "60",
+      "elk.layered.spacing.edgeEdgeBetweenLayers": "24",
+      "elk.spacing.nodeNode": "56",
+      "elk.spacing.edgeNode": "28",
+      "elk.spacing.edgeEdge": "18",
       "elk.edgeRouting": "ORTHOGONAL",
       "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
       "elk.layered.crossingMinimization.semiInteractive": "true",
@@ -577,17 +600,21 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       if (forbidden) cls += " fx-edge-forbidden";
       if (hl) cls += " fx-edge-highlighted";
 
-      // Color resolution (highlight > forbidden > back > required > optional).
+      // Color resolution (highlight > forbidden > back > forward-by-source).
+      // Forward edges take the SOURCE executor's unique color — this
+      // makes it easy to trace what comes out of each agent (NYC-subway
+      // style) and keeps the agent's avatar ring visually paired with
+      // its outgoing edges.
       const stroke =
         hl ? "#f5b556" :
         forbidden ? "#ff6b6b" :
         isBack ? "#8a93a2" :
-        "#ffffff";
+        uniqueColorFor(route.from);
       const strokeWidth =
         hl ? 3 :
         isBack ? 1.4 :
-        required ? 2.2 :
-        1.6;
+        required ? 2.4 :
+        1.8;
       const strokeDasharray =
         forbidden ? "6 4" :
         isBack ? "6 5" :
