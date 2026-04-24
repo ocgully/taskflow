@@ -294,6 +294,17 @@ footer.bottom {
   stroke-width: 1.8 !important;
   stroke-dasharray: 6 4 !important;
 }
+/* HW-0050: routes fully enforced by a Hopewell git hook — stroke colour
+ * still comes from the source hue (traceability) but we tone it down
+ * and overlay dashed styling so humans can tell these apart from
+ * orchestrator-driven edges at a glance. */
+.fx-canvas .react-flow__edge.fx-edge-auto-enforced .react-flow__edge-path {
+  stroke-dasharray: 4 3 !important;
+  opacity: 0.65;
+}
+.fx-canvas .react-flow__edge.fx-edge-auto-enforced:hover .react-flow__edge-path {
+  opacity: 0.95;
+}
 .fx-canvas .react-flow__edge .react-flow__edge-text {
   fill: var(--fg);
   font-size: 10px;

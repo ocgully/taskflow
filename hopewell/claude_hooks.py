@@ -7,6 +7,28 @@ automatically whenever a Claude agent picks up or finishes work on a
 node — without the human having to run `hopewell flow push/ack/enter/
 leave` by hand.
 
+Category-C territory (HW-0050 boundary note)
+--------------------------------------------
+
+This module is the ONLY place where Hopewell does "Category C" hook
+work: **context injection into a running AI agent session**. The
+`hopewell hooks install --full` git hooks (HW-0050, see
+`hopewell/hooks.py`) deliberately do NOT do Category C — a git hook
+runs in the shell without any knowledge that a Claude Code session is
+attached, so it can't prepend Pedia context, resume active claims, or
+inject spec slices into an agent prompt. Those injections require the
+Claude Code runtime (SessionStart / UserPromptSubmit / PreToolUse).
+
+So:
+
+  * Categories A (bookkeeping) + B (declared gates) live in git hooks
+    (`hopewell/hooks.py`, templates in `hopewell/hook_templates.py`).
+  * Category C (context injection) lives here.
+  * Category D (routing) and E (judgment) stay with the orchestrator.
+
+Keeping this split explicit prevents the two hook surfaces from racing
+to enforce the same invariant or, worse, disagreeing about it.
+
 --------------------------------------------------------------------
 Design decisions (document, then locked in)
 --------------------------------------------------------------------

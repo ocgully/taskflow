@@ -703,6 +703,11 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       const key = `${route.from}|${route.to}`;
       const hl = journeyEdges.has(key);
       const isBack = backEdges.has(key);
+      // HW-0050: routes fully enforced by a Hopewell git hook are
+      // rendered with a distinct style so humans can see which routes
+      // are hook-driven vs orchestrator-driven. The source-hue is
+      // preserved (subway-style traceability) but desaturated + dashed.
+      const autoEnforced = !!(route.data && route.data.auto_enforced);
 
       let cls = "fx-rf-edge";
       if (isBack) cls += " fx-edge-back";
@@ -710,6 +715,7 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       else if (cond) cls += " fx-edge-conditional";
       else cls += " fx-edge-optional";
       if (forbidden) cls += " fx-edge-forbidden";
+      if (autoEnforced) cls += " fx-edge-auto-enforced";
       if (hl) cls += " fx-edge-highlighted";
 
       // Color resolution (highlight > forbidden > back > forward-by-source).
@@ -718,20 +724,27 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       // while still advertising "this feedback comes FROM @X". Subway-
       // style trace: you can still follow a back-edge back to the
       // agent that produced it.
+      // For auto-enforced routes, we use the DIM variant of the source
+      // hue (keeps traceability) and overlay dashed styling + lower
+      // opacity to signal "mechanical, not orchestrator-driven".
       const stroke =
         hl ? "#f5b556" :
         forbidden ? "#ff6b6b" :
         isBack ? uniqueColorDimFor(route.from) :
+        autoEnforced ? uniqueColorDimFor(route.from) :
         uniqueColorFor(route.from);
       const strokeWidth =
         hl ? 3 :
         isBack ? 1.3 :
+        autoEnforced ? 1.4 :
         required ? 2.4 :
         1.8;
       const strokeDasharray =
         forbidden ? "6 4" :
         isBack ? "6 5" :
+        autoEnforced ? "4 3" :
         undefined;
+      const strokeOpacity = autoEnforced && !hl ? 0.65 : 1;
 
       return {
         id: `e${i}-${route.from}-${route.to}`,
@@ -751,8 +764,8 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
           width: hl ? 16 : 14,
           height: hl ? 16 : 14,
         },
-        style: { stroke, strokeWidth, strokeDasharray },
-        data: { route, key, isBack },
+        style: { stroke, strokeWidth, strokeDasharray, strokeOpacity },
+        data: { route, key, isBack, autoEnforced },
       };
     });
   }, [network, activeLayout, journeyEdges, showOnlyVisited, visitedSet]);

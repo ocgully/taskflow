@@ -292,6 +292,117 @@ def _safe_filename(eid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HW-0050 — auto-enforced route annotation
+# ---------------------------------------------------------------------------
+
+
+def routes_covered_by_hooks(net: Network) -> List[Route]:
+    """Return routes whose semantics are fully enforced by a Hopewell
+    git hook (HW-0050 gates A + B).
+
+    Coverage mapping from hook -> route pattern:
+
+      1. **post-commit hook** (category A): touches + closes nodes from
+         commit-message patterns. So any route whose source is a source-
+         component executor (inbox / event stream) going to a work-item
+         handler is effectively mechanical — the hook records the
+         handoff. We also cover routes whose `condition` mentions commit
+         semantics (`on_commit`, `committed`, `commit`).
+
+      2. **pre-push hook** (category B, trunk branches): gates release
+         readiness. Any route FROM a gate-component executor (CI / code-
+         review / release-gate) TO a target-component executor (prod /
+         main / deployment) is covered — pre-push stops the push if the
+         readiness check fails.
+
+      3. **commit-msg + pre-commit gates**: these gate ALL commits, not
+         any specific route, so they don't annotate specific edges.
+
+    The heuristic is deliberately conservative — unknown routes stay
+    unannotated. Prefer false-negative (missed annotations humans can
+    add explicitly) to false-positive (wrong route marked as mechanical).
+
+    Callers can pass the output to `annotate_auto_enforced_routes` to
+    persist the annotation in `routes.jsonl`.
+    """
+    covered: List[Route] = []
+    by_id = net.executors
+    TRIGGERS_ON_COMMIT = ("on_commit", "on-commit", "committed")
+    HOOK_COVERED_CONDITION_SUBSTRINGS = (
+        "commit", "merge to main", "merge_to_main", "push to main",
+        "push_to_main", "ready to release", "release-ready",
+    )
+    # Common id substrings that indicate "this executor is what the
+    # pre-push release-readiness gate protects".
+    RELEASE_TARGET_ID_HINTS = ("prod", "main", "release", "deploy")
+
+    for r in net.routes:
+        from_ex = by_id.get(r.from_id)
+        to_ex = by_id.get(r.to_id)
+
+        # Rule 2 — gate -> target OR gate -> trunk/prod/release-id covered
+        # by pre-push release-readiness gate.
+        if from_ex is not None and to_ex is not None:
+            from_is_gate = from_ex.has_component("gate")
+            to_is_target = to_ex.has_component("target")
+            to_id_looks_release = any(h in (to_ex.id or "").lower()
+                                      for h in RELEASE_TARGET_ID_HINTS)
+            if from_is_gate and (to_is_target or to_id_looks_release):
+                covered.append(r)
+                continue
+
+        # Rule 1 — explicit commit-triggered routes.
+        cond = (r.condition or "").lower()
+        if cond and (cond in TRIGGERS_ON_COMMIT
+                     or any(s in cond for s in HOOK_COVERED_CONDITION_SUBSTRINGS)):
+            covered.append(r)
+            continue
+    return covered
+
+
+def annotate_auto_enforced_routes(project_root: Path, routes: Iterable[Route],
+                                  *, value: bool = True) -> int:
+    """Persist `data.auto_enforced = <value>` on each route in `routes`.
+
+    Implemented as an append: we tombstone the existing record and
+    append a new record with the updated `data`. This keeps the
+    append-only contract of `routes.jsonl`. Returns the number of routes
+    updated.
+    """
+    ensure_network_dir(project_root)
+    changed = 0
+    for r in routes:
+        existing_data = dict(r.data or {})
+        if existing_data.get("auto_enforced") == value:
+            continue
+        # Tombstone old record
+        _append_route_record(project_root, {
+            "tombstone": True,
+            "from": r.from_id, "to": r.to_id,
+            "condition": r.condition or "",
+            "ts": _now(),
+        })
+        # Append new record with updated data
+        new_data = dict(existing_data)
+        new_data["auto_enforced"] = value
+        new_rec = {
+            "from": r.from_id,
+            "to": r.to_id,
+            "created": r.created or _now(),
+            "data": new_data,
+        }
+        if r.condition:
+            new_rec["condition"] = r.condition
+        if r.label:
+            new_rec["label"] = r.label
+        if r.required:
+            new_rec["required"] = True
+        _append_route_record(project_root, new_rec)
+        changed += 1
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
