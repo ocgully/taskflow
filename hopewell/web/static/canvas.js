@@ -174,20 +174,43 @@ function mixWithBg(hex, sat) {
 // ---------------------------------------------------------------------------
 
 const HANDLE_STYLE = {
-  width: 8,
-  height: 8,
-  background: "#0b0d10",
-  border: "1.5px solid var(--accent)",
+  width: 6,
+  height: 6,
+  background: "transparent",
+  border: "none",
+  opacity: 0,
 };
 
-// Shared handle-pair emitted by every custom node.
-function handles(accent) {
-  const style = { ...HANDLE_STYLE, borderColor: accent };
-  return h(Fragment, null,
-    h(Handle, { type: "target", position: Position.Left,  style, isConnectable: false }),
-    h(Handle, { type: "source", position: Position.Right, style, isConnectable: false }),
-  );
+// Five handles per side, positioned at y = 15/32.5/50/67.5/85 %. Edges
+// pick a handle based on the target's vertical offset from this node's
+// centre, so outgoing routes fan out vertically instead of stacking on
+// a single anchor point.
+const HANDLE_OFFSETS = [0.15, 0.325, 0.5, 0.675, 0.85];
+function makeHandles(accent) {
+  const base = { ...HANDLE_STYLE, borderColor: accent };
+  const nodes = [];
+  HANDLE_OFFSETS.forEach((off, i) => {
+    nodes.push(h(Handle, {
+      key: `t${i}`,
+      type: "target",
+      position: Position.Left,
+      id: `t${i}`,
+      style: { ...base, top: `${off * 100}%` },
+      isConnectable: false,
+    }));
+    nodes.push(h(Handle, {
+      key: `s${i}`,
+      type: "source",
+      position: Position.Right,
+      id: `s${i}`,
+      style: { ...base, top: `${off * 100}%` },
+      isConnectable: false,
+    }));
+  });
+  return h(Fragment, null, ...nodes);
 }
+// Keep the old name alive so existing call sites in the file work.
+const handles = makeHandles;
 
 // Agent: rounded-rect card with a circular avatar (initials).
 function AgentNode({ data, selected }) {
@@ -576,13 +599,55 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
   // Build React Flow edges from routes.
   //
   // Edge colour semantics (HW-0042 follow-up):
-  //   forward  -> white    (solid; required thicker than optional)
-  //   backward -> grey     (dashed; represents feedback / rework / cycle-closers)
-  //   forbidden-> red      (dashed; DMZ violation — reserved)
+  //   forward  -> source's unique hue (required thicker than optional)
+  //   backward -> grey (dashed; feedback / rework / cycle-closers)
+  //   forbidden-> red  (dashed; DMZ violation — reserved)
   //   highlighted (journey overlay) -> amber, always on top
+  //
+  // Handle assignment: each node has 5 source handles (right side) and
+  // 5 target handles (left side). For each node, we group its outgoing
+  // edges and sort them by target's Y position, then distribute across
+  // the 5 source handles in order. Same on the target side (sort
+  // incoming edges by source's Y, distribute across 5 target handles).
+  // This guarantees no two edges share a handle on either end (up to 5
+  // per side) and produces a clean fan-out that mimics cable-routing.
   const rfEdges = useMemo(() => {
     if (!network || !layout) return [];
     const backEdges = layout.backEdges || new Set();
+    const pos = layout.positions;
+
+    // Per-node outgoing/incoming edges with centroid-y of the opposite end.
+    const outgoing = new Map();   // sourceId -> [{key, idx, targetCy}]
+    const incoming = new Map();   // targetId -> [{key, idx, sourceCy}]
+    network.routes.forEach((r, idx) => {
+      const key = `${r.from}|${r.to}`;
+      const sp = pos[r.from];
+      const tp = pos[r.to];
+      if (!sp || !tp) return;
+      const sy = sp.y + sp.height / 2;
+      const ty = tp.y + tp.height / 2;
+      if (!outgoing.has(r.from)) outgoing.set(r.from, []);
+      outgoing.get(r.from).push({ key, idx, oppY: ty });
+      if (!incoming.has(r.to)) incoming.set(r.to, []);
+      incoming.get(r.to).push({ key, idx, oppY: sy });
+    });
+
+    const sourceHandleFor = new Map();   // edgeKey -> `s${N}`
+    const targetHandleFor = new Map();   // edgeKey -> `t${N}`
+    const assign = (map, entries, prefix) => {
+      const sorted = entries.slice().sort((a, b) => a.oppY - b.oppY);
+      const n = sorted.length;
+      const slots = HANDLE_OFFSETS.length;
+      sorted.forEach((e, i) => {
+        // Spread across available handles deterministically.
+        const slot = n === 1 ? Math.floor(slots / 2)
+                             : Math.round((i * (slots - 1)) / (n - 1));
+        map.set(e.key, `${prefix}${slot}`);
+      });
+    };
+    for (const [src, edges] of outgoing) assign(sourceHandleFor, edges, "s");
+    for (const [tgt, edges] of incoming) assign(targetHandleFor, edges, "t");
+
     return network.routes.map((r, i) => {
       const route = r || {};
       const required = !!route.required;
@@ -624,6 +689,8 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
         id: `e${i}-${route.from}-${route.to}`,
         source: route.from,
         target: route.to,
+        sourceHandle: sourceHandleFor.get(key),
+        targetHandle: targetHandleFor.get(key),
         type: "smoothstep",
         animated: false,
         className: cls,
