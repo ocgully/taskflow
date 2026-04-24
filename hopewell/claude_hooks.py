@@ -425,9 +425,99 @@ def _safe_leave(project, node_id: str, executor: str, *,
 # ---------------------------------------------------------------------------
 
 
+def _session_start_preamble(project) -> str:
+    """Compose the session-preamble text injected via stdout on SessionStart.
+
+    Claude Code's SessionStart hook injects the hook command's stdout
+    into the session as additional context. We use that to remind the
+    running agent that this project has a Hopewell flow network and the
+    convention is to route through `@orchestrator` unless overridden.
+
+    The preamble is intentionally short (a handful of lines) — it runs
+    every session start, so the token cost should amortize across all
+    the saved re-discovery work downstream.
+
+    Content:
+      * orchestrator-first routing rule
+      * `/o` and `--direct` escape hatches
+      * active claims (from hopewell resume, if cheap to read)
+      * any open reconciliation reviews
+
+    If anything errors during composition, return "" so SessionStart
+    stays silent — we MUST NOT block the session.
+    """
+    lines: List[str] = []
+    lines.append("[hopewell preamble] project has a Hopewell flow network; orchestrator-first routing is the convention.")
+    lines.append("  - Default: route every request through @orchestrator (use /o <request> or /orchestrate <request>)")
+    lines.append("  - Override: pass --direct to invoke a specific agent, or the agent may proceed for trivial reads")
+    lines.append("  - Domain agents invoked directly for substantive work should redirect to @orchestrator")
+
+    # Best-effort: surface active claims and open reviews. All failures
+    # degrade to "nothing surfaced" — never raise out of a hook.
+    try:
+        active_nodes: List[str] = []
+        marker = read_active_marker(project) or {}
+        for nid in marker.get("nodes") or []:
+            if isinstance(nid, str) and nid not in active_nodes:
+                active_nodes.append(nid)
+        for entry in marker.get("open_locations") or []:
+            nid = (entry or {}).get("node") if isinstance(entry, dict) else None
+            if isinstance(nid, str) and nid not in active_nodes:
+                active_nodes.append(nid)
+        if active_nodes:
+            lines.append(f"  - Active claims on this session: {', '.join(active_nodes)}")
+        else:
+            lines.append("  - Active claims on this session: (none - run `hopewell resume` to pick something up)")
+    except Exception:
+        pass
+
+    # Open reconciliation reviews, if cheaply queryable.
+    try:
+        from hopewell import network as net_mod
+        net = net_mod.load_network(project.root)
+        # Scan nodes for any open "downstream-review" / "reconciliation"
+        # items. Keep this defensive — the network shape varies across
+        # versions.
+        open_reviews: List[str] = []
+        nodes_iter = getattr(net, "nodes", None)
+        if nodes_iter is not None:
+            # `nodes` may be a dict {id: node} or a list.
+            iterable = nodes_iter.values() if hasattr(nodes_iter, "values") else nodes_iter
+            for node in iterable:
+                status = (getattr(node, "status", "") or "").lower()
+                components = getattr(node, "components", None) or []
+                if isinstance(components, (list, tuple, set)):
+                    comps_lower = {str(c).lower() for c in components}
+                else:
+                    comps_lower = set()
+                is_review = (
+                    "review" in comps_lower
+                    or "reconciliation" in comps_lower
+                    or "downstream-review" in comps_lower
+                )
+                is_open = status in {"ready", "doing", "review", "idea"}
+                if is_review and is_open:
+                    nid = getattr(node, "id", None)
+                    if nid:
+                        open_reviews.append(str(nid))
+                if len(open_reviews) >= 5:
+                    break
+        if open_reviews:
+            lines.append(f"  - Open reconciliation/review nodes: {', '.join(open_reviews)}")
+    except Exception:
+        pass
+
+    return "\n".join(lines) + "\n"
+
+
 def on_session_start() -> int:
-    """SessionStart: record the session id on the active marker (if a
-    project exists). No flow events emitted."""
+    """SessionStart: record the session id on the active marker AND
+    emit the orchestrator-first preamble on stdout (which Claude Code
+    injects into the session as additional context).
+
+    Silent no-op if no Hopewell project is present — preamble only
+    applies where the flow network exists.
+    """
     payload = _read_hook_input()
     project = _try_load_project()
     if project is None:
@@ -439,6 +529,16 @@ def on_session_start() -> int:
     marker.setdefault("opened_at", _now())
     # Don't clobber pre-existing open_locations from a resume.
     write_active_marker(project, marker)
+
+    # Emit the orchestrator-first preamble. Any failure in composition
+    # falls through silently — SessionStart must never block the session.
+    try:
+        preamble = _session_start_preamble(project)
+        if preamble:
+            sys.stdout.write(preamble)
+            sys.stdout.flush()
+    except Exception:
+        pass
     return 0
 
 
