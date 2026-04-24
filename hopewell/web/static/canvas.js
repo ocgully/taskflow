@@ -666,18 +666,19 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       if (hl) cls += " fx-edge-highlighted";
 
       // Color resolution (highlight > forbidden > back > forward-by-source).
-      // Forward edges take the SOURCE executor's unique color — this
-      // makes it easy to trace what comes out of each agent (NYC-subway
-      // style) and keeps the agent's avatar ring visually paired with
-      // its outgoing edges.
+      // Forward AND back edges both take the SOURCE executor's unique
+      // hue; back edges use the DIM variant so they recede visually
+      // while still advertising "this feedback comes FROM @X". Subway-
+      // style trace: you can still follow a back-edge back to the
+      // agent that produced it.
       const stroke =
         hl ? "#f5b556" :
         forbidden ? "#ff6b6b" :
-        isBack ? "#8a93a2" :
+        isBack ? uniqueColorDimFor(route.from) :
         uniqueColorFor(route.from);
       const strokeWidth =
         hl ? 3 :
-        isBack ? 1.4 :
+        isBack ? 1.3 :
         required ? 2.4 :
         1.8;
       const strokeDasharray =

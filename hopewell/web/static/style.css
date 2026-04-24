@@ -295,6 +295,25 @@ footer.bottom {
 .fx-canvas .react-flow__edge .react-flow__edge-textbg { fill: var(--bg-3); }
 .fx-canvas .react-flow__handle { pointer-events: none; }
 
+/* Edge hover — brighten the stroke and bring the edge to front without
+ * hiding the others. `filter: brightness` + saturation bump works on
+ * every per-source colour without needing to know the inline stroke. */
+.fx-canvas .react-flow__edge {
+  transition: filter 120ms ease-out;
+}
+.fx-canvas .react-flow__edge:hover {
+  filter: brightness(1.4) saturate(1.3) drop-shadow(0 0 4px rgba(255,255,255,0.25));
+  z-index: 10;
+}
+.fx-canvas .react-flow__edge:hover .react-flow__edge-path {
+  stroke-width: 3.2 !important;
+}
+/* Wider invisible hit target so thin edges are easier to grab. */
+.fx-canvas .react-flow__edge .react-flow__edge-interaction {
+  stroke-width: 16;
+  cursor: pointer;
+}
+
 /* Toolbar ------------------------------------------------------------- */
 .fx-toolbar {
   position: absolute;
