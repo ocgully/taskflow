@@ -339,3 +339,54 @@ def cmd_network_validate(args) -> int:
     for p in problems:
         print(f"  - {p}")
     return 1
+
+
+# ---------------------------------------------------------------------------
+# HW-0050 — annotate-auto-enforced
+# ---------------------------------------------------------------------------
+
+
+def cmd_network_annotate_auto_enforced(args) -> int:
+    """Mark routes covered by Hopewell's git hooks with
+    `data.auto_enforced = true`.
+
+    Default is a dry-run that prints which routes would change. Pass
+    `--apply` to persist.
+    """
+    root = _project_root(args)
+    net = net_mod.load_network(root)
+    candidates = net_mod.routes_covered_by_hooks(net)
+    new_ones = [r for r in candidates if not r.data.get("auto_enforced")]
+
+    payload = {
+        "total_routes": len(net.routes),
+        "covered_by_hooks": len(candidates),
+        "would_annotate": [
+            {"from": r.from_id, "to": r.to_id, "condition": r.condition or None}
+            for r in new_ones
+        ],
+        "already_annotated": len(candidates) - len(new_ones),
+        "applied": False,
+    }
+    if getattr(args, "apply", False):
+        changed = net_mod.annotate_auto_enforced_routes(root, new_ones)
+        payload["applied"] = True
+        payload["changed"] = changed
+
+    if args.format == "json":
+        _print_json(payload)
+        return 0
+
+    print(f"hopewell network annotate-auto-enforced")
+    print(f"  total routes:          {payload['total_routes']}")
+    print(f"  covered by hooks:      {payload['covered_by_hooks']}")
+    print(f"  already annotated:     {payload['already_annotated']}")
+    print(f"  would annotate (new):  {len(new_ones)}")
+    for r in new_ones:
+        cond = f" [{r.condition}]" if r.condition else ""
+        print(f"    - {r.from_id} -> {r.to_id}{cond}")
+    if payload["applied"]:
+        print(f"  APPLIED: {payload['changed']} route(s) updated")
+    elif new_ones:
+        print(f"  (dry-run — rerun with --apply to persist)")
+    return 0

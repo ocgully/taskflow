@@ -211,6 +211,11 @@ class Route:
     label: Optional[str] = None           # display-only
     required: bool = False
     created: str = field(default_factory=lambda: _now())
+    # HW-0050: free-form annotations on the route itself (e.g.
+    # `auto_enforced: true` when a Hopewell git hook covers this edge).
+    # Distinct from `component_data` on executors; routes don't currently
+    # carry components, so this is a flat dict.
+    data: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -224,6 +229,8 @@ class Route:
             d["label"] = self.label
         if self.required:
             d["required"] = True
+        if self.data:
+            d["data"] = dict(self.data)
         return d
 
     @classmethod
@@ -235,6 +242,7 @@ class Route:
             label=d.get("label"),
             required=bool(d.get("required", False)),
             created=d.get("created") or _now(),
+            data=dict(d.get("data") or {}),
         )
 
     def key(self) -> str:

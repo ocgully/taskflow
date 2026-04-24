@@ -98,8 +98,11 @@ hopewell query waves             # who can work in parallel
 # Close with evidence
 hopewell close HW-0001 --commit abc123 --reason "tests pass, shipped"
 
-# Keep it fresh on every commit
+# Keep it fresh on every commit (minimal: post-commit only)
 hopewell hooks install
+
+# Or install the full gate set (pre-commit + post-commit + pre-push — HW-0050)
+hopewell hooks install --full
 ```
 
 ## Version compatibility — multiple agents on different Hopewell versions
@@ -418,6 +421,96 @@ originate outside the team. That's orthogonal to coordination.)
 
 ---
 
+## Git hooks — mechanical bookkeeping + declared gates (HW-0050)
+
+Hopewell ships three git hooks, installed into `.git/hooks/` on demand.
+Pick the profile that matches how strictly you want Hopewell to gate
+day-to-day git operations:
+
+```bash
+# Minimal — post-commit only. Emits flow events + closes nodes on
+# 'fixes HW-NNNN'. Never blocks. Safe default for casual use.
+hopewell hooks install
+
+# Full — adds the pre-commit + pre-push gates on top of post-commit.
+# Recommended for projects where every commit should reference a work
+# item and trunk is protected by release-readiness.
+hopewell hooks install --full
+
+# Inspect what's installed
+hopewell hooks status
+
+# Simulate the release-readiness gate (dry-run)
+hopewell hooks test-pre-push [--branch main]
+
+# Remove all Hopewell-managed hook blocks
+hopewell hooks uninstall
+```
+
+### What each hook does
+
+| Hook | Category | Blocks when |
+|------|----------|-------------|
+| `post-commit`  | A — bookkeeping  | Never (always exits 0). Parses `HW-NNNN` from the commit message, touches affected nodes, emits flow events, closes nodes on `fixes/closes HW-NNNN`. |
+| `commit-msg`   | B — declared gate | Commit message lacks any `HW-NNNN` reference. (Runs AFTER `pre-commit` so both `-m "..."` and editor-authored messages are covered.) |
+| `pre-commit`   | B — declared gate | Spec-refs are drifted and no active reconciliation review covers them. |
+| `pre-push`     | B — declared gate | Pushing to `main` / `master` / `trunk` and any in-progress release node scores below its threshold. Non-trunk pushes are never gated. |
+
+### Bypass
+
+Every gate respects the same environment variable. Use sparingly; it's
+for genuinely exceptional commits (WIP branches, doc-only tweaks, bulk
+refactor merges) — your team should have a shared norm about when it's
+appropriate.
+
+```bash
+HOPEWELL_SKIP_HOOKS=1 git commit -m "wip: no ticket yet"
+HOPEWELL_SKIP_HOOKS=1 git push origin main
+```
+
+Per-gate overrides also exist for CI / automation scripts:
+
+```bash
+HOPEWELL_GATE_SKIP_HW_REF=1   # skip just the hw-ref gate
+HOPEWELL_GATE_SKIP_DRIFT=1    # skip just the drift gate
+HOPEWELL_GATE_SKIP_RELEASE=1  # skip just the release-readiness gate
+```
+
+### Why git hooks for A + B, and Claude hooks for C
+
+* **Category A (bookkeeping)** — recording that a commit references HW-0042
+  is pure mechanism. Git hooks do it reliably, whether you're in Claude
+  Code, a terminal, an IDE, or running git from a CI job.
+* **Category B (declared gates)** — drift + release-readiness are
+  declarative invariants; they should bind the git operation itself, not
+  just AI sessions.
+* **Category C (context injection — Pedia, resume, spec slices)** — this
+  requires knowing that an AI agent is running. Git hooks can't do it.
+  See `hopewell claude-hooks install` (HW-0040) for the Claude Code
+  hooks that cover Category C.
+
+See also: [Hooks vs. orchestrator — scope analysis](https://github.com/ocgully/AgentFactory/blob/main/patterns/drafts/hooks-vs-orchestrator.md)
+which defines categories A through E and justifies why routing +
+judgment stay with the orchestrator.
+
+### Visualising which routes hooks cover
+
+When a flow-network route is fully enforced by a git hook (e.g.
+`code-review -> release` covered by `pre-push`'s release-score check),
+annotate it so the web canvas renders it with a distinct style:
+
+```bash
+hopewell network annotate-auto-enforced           # dry-run
+hopewell network annotate-auto-enforced --apply   # persist
+```
+
+Annotated routes show up in the canvas as dashed, desaturated edges that
+preserve their source hue. Humans see "this edge is hook-driven, not
+orchestrator-driven" at a glance; the orchestrator doesn't need to
+think about those routes because Hopewell already enforces them.
+
+---
+
 ## GitHub ingestion
 
 One-way sync: GitHub issues → Hopewell nodes. Used for cases where tasks
@@ -618,7 +711,9 @@ hopewell uat unflag <id> --reason "..."
 
 hopewell github {sync|pull|config} [ref] [--since <ts>] [--state open|closed|all]
 
-hopewell hooks {install|uninstall}
+hopewell hooks {install|uninstall|status|test-pre-push} [--full|--minimal] [--claude-code]
+
+hopewell network annotate-auto-enforced [--apply]
 ```
 
 `hw` is an alias for `hopewell`.

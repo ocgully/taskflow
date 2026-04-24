@@ -100,11 +100,23 @@ def _actor_from_env() -> Optional[str]:
 def cmd_init(args) -> int:
     from hopewell.project import Project
     root = Path(args.project_root).resolve() if args.project_root else Path.cwd()
-    project = Project.init(root, id_prefix=args.prefix, name=args.name)
+    auto_backfill = not getattr(args, "no_backfill", False)
+    project = Project.init(root, id_prefix=args.prefix, name=args.name,
+                           auto_backfill=auto_backfill)
     if not args.quiet:
         print(f"Initialized {project.hw_dir}")
         print(f"  project name: {project.cfg.name}")
         print(f"  id_prefix:    {project.cfg.id_prefix}")
+        # Surface backfill outcome if it ran
+        ledger = project.hw_dir / "backfill-sources.jsonl"
+        if auto_backfill and ledger.is_file():
+            try:
+                n = sum(1 for _ in ledger.open(encoding="utf-8"))
+                if n:
+                    print(f"  backfill:     {n} source record(s) ingested "
+                          "(see `hopewell list`)")
+            except OSError:
+                pass
         print("  next steps:   `hopewell new --components work-item --title \"...\"`")
     return 0
 
@@ -836,26 +848,103 @@ def cmd_github(args) -> int:
 def cmd_hooks(args) -> int:
     project = _project(args)
     claude_code = bool(getattr(args, "claude_code", False))
+    full = bool(getattr(args, "full", False))
+    minimal = bool(getattr(args, "minimal", False))
+    if full and minimal:
+        print("hopewell hooks: --full and --minimal are mutually exclusive", file=sys.stderr)
+        return 2
     if args.action == "install":
-        path = hooks_mod.install(project.root)
+        installed = hooks_mod.install(project.root, full=full)
         if not args.quiet:
-            print(f"Installed {path}")
+            for name, path in installed.items():
+                print(f"Installed {name} -> {path}")
+            if not full:
+                print("(minimal install — run `hopewell hooks install --full` for gates)")
         if claude_code:
             rc = ch_cli_mod.cmd_install_claude_code(args)
             if rc != 0:
                 return rc
         return 0
     if args.action == "uninstall":
-        ok = hooks_mod.uninstall(project.root)
+        removed = hooks_mod.uninstall(project.root)
         if not args.quiet:
-            print("Uninstalled." if ok else "No hopewell hook found.")
+            any_removed = any(removed.values())
+            if any_removed:
+                for name, did in removed.items():
+                    if did:
+                        print(f"Uninstalled {name}")
+            else:
+                print("No hopewell hook found.")
         if claude_code:
             rc = ch_cli_mod.cmd_uninstall_claude_code(args)
             if rc != 0:
                 return rc
         return 0
+    if args.action == "status":
+        st = hooks_mod.status(project.root)
+        _print_json(st) if getattr(args, "format", "text") == "json" else _print_hooks_status(st)
+        return 0
+    if args.action == "test-pre-push":
+        # Dry-run the release-readiness gate (stage-independent).
+        from hopewell import gates as gates_mod
+        res = gates_mod.check_release_readiness(project.root,
+                                                branch=getattr(args, "branch", None))
+        print(res.format_for_hook())
+        return 0 if res.ok else 1
     print(f"hopewell: unknown hooks action '{args.action}'", file=sys.stderr)
     return 1
+
+
+def _print_hooks_status(st) -> None:
+    if not st:
+        print("(no hooks dir — not a git repo?)")
+        return
+    for name, info in st.items():
+        flag = "managed" if info.get("managed") else ("other" if info.get("installed") else "absent")
+        print(f"  {name:<12} [{flag}]  {info.get('path','')}")
+
+
+# Gate runner — invoked by the installed hook scripts. Exits:
+#   0   gate passed, proceed
+#   1   gate blocked, abort the git operation
+#   100 gate skipped (tooling unavailable / not configured) — hooks treat as pass
+def cmd_gate(args) -> int:
+    from hopewell import gates as gates_mod
+    name = args.gate_name
+    if name == "hw-ref":
+        if getattr(args, "stdin", False):
+            msg = sys.stdin.read()
+        else:
+            msg = args.message or ""
+        try:
+            project = _project(args)
+            prefix = project.cfg.id_prefix
+        except Exception:  # noqa: BLE001 — no project: skip
+            return 100
+        res = gates_mod.check_hw_reference(msg, prefix=prefix)
+    elif name == "drift":
+        try:
+            project = _project(args)
+        except Exception:  # noqa: BLE001
+            return 100
+        res = gates_mod.check_drift(project.root)
+    elif name == "release":
+        try:
+            project = _project(args)
+        except Exception:  # noqa: BLE001
+            return 100
+        res = gates_mod.check_release_readiness(project.root,
+                                                branch=getattr(args, "branch", None))
+    else:
+        print(f"hopewell gate: unknown gate '{name}'", file=sys.stderr)
+        return 2
+
+    # Report to stderr so the hook's own `echo` output doesn't pollute
+    # machine-readable stdout of any piped invocation.
+    sys.stderr.write(res.format_for_hook() + "\n")
+    if res.skipped:
+        return 100
+    return 0 if res.ok else 1
 
 
 # Internal: invoked by the installed hook script.
@@ -919,7 +1008,34 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prefix", default="HW")
     sp.add_argument("--name", default=None)
     sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--no-backfill", action="store_true",
+                    help="Skip auto-backfill on init (default: auto-fire if "
+                         "the project has git history or discoverable sources)")
     sp.set_defaults(func=cmd_init)
+
+    # backfill (HW-0049)
+    from hopewell import backfill_cli as _backfill_cli_mod
+    sp = sub.add_parser(
+        "backfill",
+        help="Populate .hopewell/nodes/ from git history / issues / TODO / specs",
+    )
+    sp.add_argument(
+        "--source", default="git,todo,spec",
+        help="Comma-separated: git | issues | todo | spec | all "
+             "(default: git,todo,spec — issues is opt-in)",
+    )
+    sp.add_argument("--since", default=None,
+                    help="ISO date; commits/issues older are ignored "
+                         "(default: 180 days ago)")
+    sp.add_argument("--github", action="store_true",
+                    help="Include GitHub issues via `gh` CLI (implies --source issues)")
+    sp.add_argument("--github-repo", default=None,
+                    help="owner/name (defaults to gh's autodetection)")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--limit", type=int, default=None,
+                    help="Cap commits scanned (safety valve)")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=_backfill_cli_mod.cmd_backfill)
 
     # new
     sp = sub.add_parser("new", help="Create a new node")
@@ -1087,6 +1203,14 @@ def _build_parser() -> argparse.ArgumentParser:
     np = nsub.add_parser("validate", help="Run validation rules")
     np.add_argument("--format", choices=["text", "json"], default="text")
     np.set_defaults(func=lambda a: network_cli_mod.cmd_network_validate(a))
+
+    # annotate-auto-enforced — HW-0050
+    np = nsub.add_parser("annotate-auto-enforced",
+                         help="Mark routes covered by Hopewell git hooks with data.auto_enforced=true")
+    np.add_argument("--apply", action="store_true",
+                    help="Persist the annotation (default: dry-run)")
+    np.add_argument("--format", choices=["text", "json"], default="text")
+    np.set_defaults(func=lambda a: network_cli_mod.cmd_network_annotate_auto_enforced(a))
 
     # flow — flow runtime: push/ack/enter/leave/where/inbox (HW-0028)
     sp = sub.add_parser("flow", help="Flow runtime: push/ack/enter/leave/inbox (v0.8)")
@@ -1478,9 +1602,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_github)
 
     # hooks
-    sp = sub.add_parser("hooks", help="Install/uninstall the git post-commit hook")
-    sp.add_argument("action", choices=["install", "uninstall"])
+    sp = sub.add_parser("hooks", help="Install/uninstall/inspect Hopewell's git hooks")
+    sp.add_argument("action", choices=["install", "uninstall", "status", "test-pre-push"])
     sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--full", action="store_true",
+                    help="(install) Install post-commit + pre-commit + pre-push (HW-0050 default)")
+    sp.add_argument("--minimal", action="store_true",
+                    help="(install) Install only the post-commit bookkeeping hook")
+    sp.add_argument("--branch", default=None,
+                    help="(test-pre-push) Simulate push from this branch (default: current)")
+    sp.add_argument("--format", choices=["text", "json"], default="text",
+                    help="(status) Output format")
     sp.add_argument("--claude-code", dest="claude_code", action="store_true",
                     help="(HW-0040) Also install/uninstall Claude Code hooks in ~/.claude/settings.json")
     sp.add_argument("--dry-run", action="store_true",
@@ -1490,6 +1622,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scope", choices=["user", "project"], default="user",
                     help="(--claude-code) user=~/.claude, project=./.claude")
     sp.set_defaults(func=cmd_hooks)
+
+    # gate — internal; invoked by installed hook scripts (HW-0050)
+    sp = sub.add_parser("gate", help=argparse.SUPPRESS)
+    sp.add_argument("gate_name", choices=["hw-ref", "drift", "release"])
+    sp.add_argument("--stdin", action="store_true",
+                    help="(hw-ref) Read commit message from stdin")
+    sp.add_argument("--message", default=None,
+                    help="(hw-ref) Commit message inline (alternative to --stdin)")
+    sp.add_argument("--branch", default=None,
+                    help="(release) Branch name to gate against")
+    sp.set_defaults(func=cmd_gate)
 
     # hook-on-commit (internal — invoked by the hook script)
     sp = sub.add_parser("hook-on-commit", help=argparse.SUPPRESS)
