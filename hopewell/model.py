@@ -57,6 +57,12 @@ class EdgeKind(str, enum.Enum):
     consumes = "consumes"       # inverse of produces, stored separately for fast reverse lookup
     parent = "parent"           # grouping: downstream is a child of upstream
     related = "related"         # informational, no execution constraint
+    references = "references"   # A consults / cites B — no execution constraint.
+                                # Introduced with HW-0033 (comment-review promotion)
+                                # so a review node can point back at the node it
+                                # commented on. Distinct from `related`: this
+                                # asserts directional consultation ("A references
+                                # B"), not a symmetric affinity.
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +266,25 @@ BUILTIN_COMPONENTS: List[Component] = [
             ),
         },
     ),
+    Component(
+        name="comment-review",
+        description=(
+            "Review node promoted from a comment thread (HW-0033). "
+            "component_data pins the originating thread id + the node (or "
+            "spec path) the comment was anchored on so the review can be "
+            "traced back to the discussion that spawned it. Always paired "
+            "with a `references` edge to the commented-on node."
+        ),
+        schema={
+            "thread_id": "string (comment id — e.g. c-abc123)",
+            "commented_on": "string (node id OR spec path, same shape as anchor target)",
+            "anchor": (
+                "object {type: whole-file|heading-section|line-range, "
+                "heading_slug?, lines?, content_hash?, explicit_anchor?}"
+            ),
+        },
+        required_fields=["thread_id", "commented_on"],
+    ),
 ]
 
 
@@ -358,6 +383,10 @@ class Node:
     blocks: List[str] = field(default_factory=list)
     blocked_by: List[str] = field(default_factory=list)
     related: List[str] = field(default_factory=list)
+    # HW-0033: directional "A references B" edge material (e.g. a
+    # comment-review node pointing back at the node it commented on).
+    # Separate from `related` so it's unambiguously directional.
+    references: List[str] = field(default_factory=list)
     component_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # v0.8 (HW-0028): multi-location presence in the flow network.
     # A WorkItem can be at several Executors at once; each NodeLocation
@@ -396,7 +425,7 @@ class Node:
         "id", "status", "priority", "created", "updated",
         "owner", "project", "parent", "components",
         "inputs", "outputs", "blocks", "blocked_by", "related",
-        "component_data", "locations",
+        "references", "component_data", "locations",
     }
 
     # ---- flow/location helpers (HW-0028) ----
@@ -437,6 +466,8 @@ class Node:
             d["blocked_by"] = list(self.blocked_by)
         if self.related:
             d["related"] = list(self.related)
+        if self.references:
+            d["references"] = list(self.references)
         if self.component_data:
             d["component_data"] = self.component_data
         if self.locations:
@@ -466,6 +497,7 @@ class Node:
             blocks=list(fm.get("blocks", [])),
             blocked_by=list(fm.get("blocked_by", [])),
             related=list(fm.get("related", [])),
+            references=list(fm.get("references", [])),
             component_data=dict(fm.get("component_data", {})),
             locations=[NodeLocation.from_dict(x) for x in (fm.get("locations") or [])
                        if isinstance(x, dict)],

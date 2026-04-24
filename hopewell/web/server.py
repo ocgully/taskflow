@@ -502,6 +502,199 @@ def create_app(project_root: Path):
             raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True, "repin": result}
 
+    # ---- Comment endpoints (HW-0033) -----------------------------------
+    #
+    # Comments live in `.hopewell/comments.jsonl` as an append-only event
+    # stream. Projection + reconciliation happen server-side on every
+    # read so the viewer sees drift/orphan state without an extra call.
+    #
+    #   GET  /api/comments/orphans                  — bucket of un-resolvable anchors
+    #   GET  /api/comments/{target}                 — threads for a node OR spec path
+    #   POST /api/comments                          — post a new comment
+    #   PATCH /api/comments/{id}                    — edit body
+    #   POST /api/comments/{id}/resolve             — resolve
+    #   POST /api/comments/{id}/reopen              — reopen
+    #   POST /api/comments/{id}/promote             — promote to comment-review node
+
+    def _thread_payload(t) -> Dict[str, Any]:
+        return t.to_dict()
+
+    @app.get("/api/comments/orphans")
+    def _comment_orphans() -> Dict[str, Any]:
+        from hopewell import comment as comment_mod
+        p = _load_project(project_root)
+        orph = comment_mod.orphans(p)
+        return {
+            "count": len(orph),
+            "threads": [_thread_payload(t) for t in orph],
+        }
+
+    @app.post("/api/comments")
+    async def _comment_post(request: Request) -> Dict[str, Any]:
+        """Post a new comment.
+
+        Body:
+            {
+              "target": "HW-0042" | "specs/x.md",
+              "body":   "...",
+              "anchor": {
+                 "type": "whole-file" | "heading-section" | "line-range",
+                 "heading": "...",            # for heading-section (text or slug)
+                 "lines":   [start, end],     # for line-range
+                 "explicit_anchor": "name"    # optional escape hatch
+              },
+              "actor":  "@chris"              # optional; falls back to header
+            }
+        """
+        from hopewell import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        target = body.get("target")
+        text = body.get("body")
+        if not target or not text:
+            raise HTTPException(status_code=400, detail="`target` and `body` required")
+        anchor = body.get("anchor") or {"type": "whole-file"}
+        if not isinstance(anchor, dict):
+            raise HTTPException(status_code=400, detail="`anchor` must be an object")
+        anchor_type = anchor.get("type") or "whole-file"
+        if anchor_type not in comment_mod.ANCHOR_TYPES:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown anchor type: {anchor_type}")
+        kwargs: Dict[str, Any] = {"anchor_type": anchor_type}
+        if anchor_type == comment_mod.ANCHOR_HEADING:
+            heading = anchor.get("heading") or anchor.get("heading_slug")
+            if not heading:
+                raise HTTPException(status_code=400,
+                                    detail="heading-section anchor needs `heading`")
+            kwargs["heading"] = heading
+        elif anchor_type == comment_mod.ANCHOR_LINE_RANGE:
+            lines = anchor.get("lines")
+            try:
+                kwargs["lines"] = (int(lines[0]), int(lines[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400,
+                                    detail="line-range anchor needs `lines: [start, end]`")
+        if anchor.get("explicit_anchor"):
+            kwargs["explicit_anchor"] = anchor.get("explicit_anchor")
+
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.post(p, target, text, actor=actor, **kwargs)
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.get("/api/comments/{target:path}")
+    def _comments_for_target(target: str,
+                             status: str = "open") -> Dict[str, Any]:
+        """List threads for a target.
+
+        `target` is a node id (HW-0042) or spec path (specs/x.md). FastAPI's
+        `{target:path}` accepts slashes so paths pass through cleanly.
+        """
+        from hopewell import comment as comment_mod
+        p = _load_project(project_root)
+        try:
+            threads = comment_mod.threads_for_target(p, target)
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        status = (status or "open").lower()
+        if status == "open":
+            threads = [t for t in threads if not t.resolved]
+        elif status == "resolved":
+            threads = [t for t in threads if t.resolved]
+        # else "all"
+        return {
+            "target": target,
+            "status": status,
+            "count": len(threads),
+            "threads": [_thread_payload(t) for t in threads],
+        }
+
+    @app.patch("/api/comments/{comment_id}")
+    async def _comment_edit(comment_id: str, request: Request) -> Dict[str, Any]:
+        from hopewell import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict) or not body.get("body"):
+            raise HTTPException(status_code=400, detail="`body` required")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.edit(p, comment_id, body["body"], actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/resolve")
+    async def _comment_resolve(comment_id: str, request: Request) -> Dict[str, Any]:
+        from hopewell import comment as comment_mod
+        reason: Optional[str] = None
+        actor: Optional[str] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = body.get("reason")
+                actor = body.get("actor")
+        except Exception:
+            pass
+        actor = actor or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.resolve(p, comment_id, reason=reason, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/reopen")
+    async def _comment_reopen(comment_id: str, request: Request) -> Dict[str, Any]:
+        from hopewell import comment as comment_mod
+        actor: Optional[str] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                actor = body.get("actor")
+        except Exception:
+            pass
+        actor = actor or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.reopen(p, comment_id, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/promote")
+    async def _comment_promote(comment_id: str, request: Request) -> Dict[str, Any]:
+        from hopewell import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        title = body.get("title")
+        if not title:
+            raise HTTPException(status_code=400, detail="`title` required")
+        body_prefix = body.get("body_prefix") or ""
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            result = comment_mod.promote(p, comment_id, title,
+                                         body_prefix=body_prefix, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, **result}
+
     @app.get("/api/history")
     def _history(limit: int = 50, cursor: int = 0) -> Dict[str, Any]:
         """Return done nodes reverse-chron with close metadata + deps for tree view.

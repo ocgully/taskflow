@@ -1045,3 +1045,190 @@ footer.bottom {
   padding: 1px 6px; border-radius: 3px; background: var(--bg-3);
   border: 1px solid var(--border); font-size: 11px;
 }
+
+/* HW-0033 — Comment threads on the viewer */
+
+.comments-panel {
+  margin-top: 28px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.comments-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.comments-head h3 {
+  margin: 0;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-muted);
+}
+.comments-stats { font-size: 11px; }
+.comments-filter {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+.comment-filter-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.comment-filter-btn.active {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: var(--bg-3);
+}
+.comments-empty {
+  font-style: italic;
+  padding: 8px 0;
+  font-size: 12px;
+}
+.comment-err { color: var(--err); font-size: 11px; }
+
+/* Composer */
+.comment-composer {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.composer-anchor-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+}
+.composer-anchor-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.composer-heading-select,
+.composer-line-input {
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 12px;
+  max-width: 320px;
+}
+.composer-body {
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+  min-height: 48px;
+}
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Thread card */
+.comment-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.comment-card.resolved {
+  opacity: 0.7;
+  border-style: dashed;
+}
+.comment-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.comment-author {
+  font-family: ui-monospace, monospace;
+  color: var(--accent);
+}
+.comment-ts { font-size: 10px; }
+.comment-anchor-badge {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+.comment-anchor-badge.drift {
+  color: var(--warn);
+  border-color: rgba(245, 181, 86, 0.45);
+}
+.comment-anchor-badge.warn {
+  color: var(--err);
+  border-color: rgba(255, 107, 107, 0.45);
+}
+.comment-state-badge.resolved {
+  font-size: 10px;
+  color: var(--ok);
+  border: 1px solid rgba(91, 212, 155, 0.35);
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.comment-body { font-size: 12px; line-height: 1.5; }
+.comment-body p { margin: 4px 0; }
+.comment-resolve-reason {
+  font-size: 11px;
+  font-style: italic;
+}
+.comment-actions { display: flex; gap: 8px; }
+.comment-btn {
+  background: var(--bg-3);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.comment-btn:hover:not(:disabled) { border-color: var(--accent); }
+.comment-btn:disabled { opacity: 0.5; cursor: default; }
+.comment-btn.primary { color: var(--accent); }
+.comment-promote {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+  margin-top: 4px;
+}
+.comment-promote-title {
+  flex: 1;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-size: 12px;
+}

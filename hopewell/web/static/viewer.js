@@ -52,6 +52,62 @@ async function repinSlice(nodeId, body) {
   return r.json();
 }
 
+// ---- Comment fetch helpers (HW-0033) -------------------------------------
+
+async function fetchComments(target, status = "all") {
+  const r = await fetch(
+    `/api/comments/${encodeURIComponent(target)}?status=${encodeURIComponent(status)}`
+  );
+  if (!r.ok) throw new Error(`/api/comments -> ${r.status}`);
+  return r.json();
+}
+
+async function postComment(body) {
+  const r = await fetch(`/api/comments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`/api/comments POST -> ${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
+async function resolveComment(id, reason) {
+  const r = await fetch(`/api/comments/${encodeURIComponent(id)}/resolve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  if (!r.ok) throw new Error(`resolve -> ${r.status}`);
+  return r.json();
+}
+
+async function reopenComment(id) {
+  const r = await fetch(`/api/comments/${encodeURIComponent(id)}/reopen`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) throw new Error(`reopen -> ${r.status}`);
+  return r.json();
+}
+
+async function promoteComment(id, title) {
+  const r = await fetch(`/api/comments/${encodeURIComponent(id)}/promote`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`promote -> ${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
 // ---------------------------------------------------------------------------
 // Mermaid (lazy + singleton)
 // ---------------------------------------------------------------------------
@@ -459,6 +515,322 @@ function SpecOverlay({ path, onBack }) {
       )),
     ),
     body,
+    // HW-0033: comment threads anchored on this spec file
+    spec && h(CommentsPanel, { target: path, markdown: spec.text || "" }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Comments panel (HW-0033)
+// ---------------------------------------------------------------------------
+//
+// Appended below the markdown body. Shows open threads by default; toggle
+// to include resolved. "Add comment" composer posts to whatever the
+// current target is (a node id — spec-file comments are exposed via the
+// same endpoint when the viewer is in spec-overlay mode).
+//
+// Anchor controls on the composer are intentionally minimal: whole-file
+// vs heading-section (pick a heading from the doc) vs line-range (enter
+// manually). The point here is to exercise every path from the UI; a
+// fancier gutter/line-picker can come later without touching the
+// endpoint contract.
+//
+// Each thread card surfaces its anchor state ("resolved" / "drifted" /
+// "orphaned") so the user immediately sees when an anchor has slid.
+
+function AnchorBadge({ anchor, reconciled }) {
+  const state = (reconciled && reconciled._state) || "unknown";
+  const cls = state === "orphaned"
+    ? "comment-anchor-badge warn"
+    : state === "drifted"
+      ? "comment-anchor-badge drift"
+      : "comment-anchor-badge";
+  const label = state === "orphaned"
+    ? "NEEDS RE-ANCHOR"
+    : state === "drifted" ? "drifted" : "pinned";
+  const typ = (anchor && anchor.type) || "whole-file";
+  let where = "(whole-file)";
+  if (typ === "heading-section") {
+    where = `#${anchor.heading_slug || "?"}`;
+  } else if (typ === "line-range") {
+    const ln = (reconciled && reconciled.lines) || anchor.lines || [0, 0];
+    where = `L${ln[0]}-L${ln[1]}`;
+  }
+  return h("span", { class: cls }, `${where} · ${label}`);
+}
+
+function CommentCard({ thread, onResolve, onReopen, onPromote, pending }) {
+  const [showPromote, setShowPromote] = useState(false);
+  const [title, setTitle] = useState(`Address comment ${thread.id}`);
+  const anchor = thread.anchor || {};
+  const reconciled = thread.reconciled_anchor || {};
+  const resolved = !!thread.resolved;
+
+  return h("div", { class: `comment-card ${resolved ? "resolved" : ""}` },
+    h("div", { class: "comment-head" },
+      h("span", { class: "comment-author" }, thread.actor || "(anon)"),
+      h("span", { class: "comment-ts muted" }, thread.ts),
+      h(AnchorBadge, { anchor, reconciled }),
+      resolved && h("span", { class: "comment-state-badge resolved" }, "resolved"),
+    ),
+    h("div", { class: "comment-body", dangerouslySetInnerHTML: {
+      __html: renderMarkdown(thread.body || ""),
+    } }),
+    thread.resolve_reason && h("div", { class: "comment-resolve-reason muted" },
+      `resolved: ${thread.resolve_reason}`),
+    h("div", { class: "comment-actions" },
+      !resolved && h("button", {
+        class: "comment-btn",
+        disabled: pending,
+        onClick: () => {
+          const reason = window.prompt("resolve reason (optional)") || "";
+          onResolve(thread.id, reason);
+        },
+      }, "Resolve"),
+      resolved && h("button", {
+        class: "comment-btn",
+        disabled: pending,
+        onClick: () => onReopen(thread.id),
+      }, "Reopen"),
+      h("button", {
+        class: "comment-btn",
+        disabled: pending,
+        onClick: () => setShowPromote((v) => !v),
+      }, showPromote ? "Cancel promote" : "Promote to review"),
+    ),
+    showPromote && h("div", { class: "comment-promote" },
+      h("input", {
+        class: "comment-promote-title",
+        type: "text",
+        value: title,
+        onInput: (ev) => setTitle(ev.target.value),
+        placeholder: "Review-node title…",
+      }),
+      h("button", {
+        class: "comment-btn primary",
+        disabled: pending || !title.trim(),
+        onClick: async () => {
+          const ok = await onPromote(thread.id, title.trim());
+          if (ok) setShowPromote(false);
+        },
+      }, pending ? "…" : "Create review"),
+    ),
+  );
+}
+
+function CommentComposer({ target, onPosted, headings }) {
+  const [anchorKind, setAnchorKind] = useState("whole-file");
+  const [headingSlug, setHeadingSlug] = useState("");
+  const [lineRange, setLineRange] = useState("");
+  const [body, setBody] = useState("");
+  const [pending, setPending] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!headingSlug && headings && headings.length > 0) {
+      setHeadingSlug(headings[0].slug);
+    }
+  }, [headings, headingSlug]);
+
+  const submit = useCallback(async () => {
+    if (!body.trim()) return;
+    setPending(true); setErr(null);
+    const anchor = { type: anchorKind };
+    if (anchorKind === "heading-section") {
+      if (!headingSlug) { setErr("pick a heading"); setPending(false); return; }
+      anchor.heading = headingSlug;
+    } else if (anchorKind === "line-range") {
+      const m = lineRange.match(/^\s*(\d+)\s*-\s*(\d+)\s*$/);
+      if (!m) { setErr("lines must be like 45-72"); setPending(false); return; }
+      anchor.lines = [parseInt(m[1], 10), parseInt(m[2], 10)];
+    }
+    try {
+      await postComment({ target, body, anchor });
+      setBody("");
+      setLineRange("");
+      if (onPosted) onPosted();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setPending(false);
+    }
+  }, [target, body, anchorKind, headingSlug, lineRange, onPosted]);
+
+  return h("div", { class: "comment-composer" },
+    h("div", { class: "composer-anchor-row" },
+      h("label", null,
+        h("input", {
+          type: "radio", name: "anchor-kind", value: "whole-file",
+          checked: anchorKind === "whole-file",
+          onChange: () => setAnchorKind("whole-file"),
+        }),
+        " whole file",
+      ),
+      h("label", null,
+        h("input", {
+          type: "radio", name: "anchor-kind", value: "heading-section",
+          checked: anchorKind === "heading-section",
+          onChange: () => setAnchorKind("heading-section"),
+        }),
+        " heading",
+      ),
+      h("label", null,
+        h("input", {
+          type: "radio", name: "anchor-kind", value: "line-range",
+          checked: anchorKind === "line-range",
+          onChange: () => setAnchorKind("line-range"),
+        }),
+        " lines",
+      ),
+      anchorKind === "heading-section" && h("select", {
+        class: "composer-heading-select",
+        value: headingSlug,
+        onChange: (ev) => setHeadingSlug(ev.target.value),
+      },
+        (headings || []).length === 0
+          ? h("option", { value: "" }, "(no headings)")
+          : (headings || []).map((h2) =>
+              h("option", { key: h2.slug, value: h2.slug },
+                `${"#".repeat(h2.level)} ${h2.text}`)),
+      ),
+      anchorKind === "line-range" && h("input", {
+        class: "composer-line-input",
+        type: "text",
+        placeholder: "e.g. 45-72",
+        value: lineRange,
+        onInput: (ev) => setLineRange(ev.target.value),
+      }),
+    ),
+    h("textarea", {
+      class: "composer-body",
+      placeholder: "Write a comment… (markdown ok)",
+      value: body,
+      onInput: (ev) => setBody(ev.target.value),
+      rows: 3,
+    }),
+    h("div", { class: "composer-actions" },
+      err && h("span", { class: "comment-err" }, err),
+      h("button", {
+        class: "comment-btn primary",
+        disabled: pending || !body.trim(),
+        onClick: submit,
+      }, pending ? "posting…" : "Post comment"),
+    ),
+  );
+}
+
+function extractHeadings(markdown) {
+  // Simple scan for ATX headings (# .. ######). Slug matches comment.py.
+  const out = [];
+  if (!markdown) return out;
+  const lines = markdown.split("\n");
+  for (const line of lines) {
+    const m = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const text = m[2].trim();
+    const slug = text.toLowerCase()
+      .replace(/[^a-z0-9\- ]+/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    out.push({ level: m[1].length, text, slug });
+  }
+  return out;
+}
+
+function CommentsPanel({ target, markdown }) {
+  const [bundle, setBundle] = useState(null);
+  const [err, setErr] = useState(null);
+  const [statusFilter, setStatusFilter] = useState("open");
+  const [pendingId, setPendingId] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setErr(null);
+    try {
+      const d = await fetchComments(target, "all");
+      setBundle(d);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }, [target]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const headings = useMemo(() => extractHeadings(markdown || ""), [markdown]);
+
+  const threads = useMemo(() => {
+    const all = (bundle && bundle.threads) || [];
+    if (statusFilter === "open") return all.filter((t) => !t.resolved);
+    if (statusFilter === "resolved") return all.filter((t) => t.resolved);
+    return all;
+  }, [bundle, statusFilter]);
+
+  const openCount = useMemo(() => {
+    const all = (bundle && bundle.threads) || [];
+    return all.filter((t) => !t.resolved).length;
+  }, [bundle]);
+  const orphanCount = useMemo(() => {
+    const all = (bundle && bundle.threads) || [];
+    return all.filter((t) => (t.reconciled_anchor || {})._state === "orphaned").length;
+  }, [bundle]);
+
+  const doResolve = useCallback(async (id, reason) => {
+    setPendingId(id);
+    try { await resolveComment(id, reason); await refresh(); }
+    catch (e) { alert(`resolve failed: ${e}`); }
+    finally { setPendingId(null); }
+  }, [refresh]);
+
+  const doReopen = useCallback(async (id) => {
+    setPendingId(id);
+    try { await reopenComment(id); await refresh(); }
+    catch (e) { alert(`reopen failed: ${e}`); }
+    finally { setPendingId(null); }
+  }, [refresh]);
+
+  const doPromote = useCallback(async (id, title) => {
+    setPendingId(id);
+    try {
+      const res = await promoteComment(id, title);
+      await refresh();
+      alert(`Created review node ${res.review_node} (references ${res.references && res.references.to})`);
+      return true;
+    } catch (e) {
+      alert(`promote failed: ${e}`);
+      return false;
+    } finally {
+      setPendingId(null);
+    }
+  }, [refresh]);
+
+  return h("div", { class: "comments-panel" },
+    h("div", { class: "comments-head" },
+      h("h3", null, "Comments"),
+      h("span", { class: "muted comments-stats" },
+        `${openCount} open`,
+        orphanCount > 0 ? `, ${orphanCount} need re-anchor` : "",
+      ),
+      h("span", { class: "comments-filter" },
+        ["open", "resolved", "all"].map((s) => h("button", {
+          key: s,
+          class: `comment-filter-btn ${statusFilter === s ? "active" : ""}`,
+          onClick: () => setStatusFilter(s),
+        }, s)),
+      ),
+    ),
+    err && h("div", { class: "comment-err" }, err),
+    h(CommentComposer, { target, onPosted: refresh, headings }),
+    threads.length === 0
+      ? h("div", { class: "muted comments-empty" },
+          `No ${statusFilter === "all" ? "" : statusFilter + " "}comments yet.`)
+      : threads.map((t) => h(CommentCard, {
+          key: t.id,
+          thread: t,
+          pending: pendingId === t.id,
+          onResolve: doResolve,
+          onReopen: doReopen,
+          onPromote: doPromote,
+        })),
   );
 }
 
@@ -548,6 +920,8 @@ export function DocViewer({ nodeId, onClose, onSelectNode }) {
           }),
         ),
       ),
+      // HW-0033: comment threads anchored on this node's .md
+      h(CommentsPanel, { target: nodeId, markdown: doc.markdown || "" }),
     );
   }
 

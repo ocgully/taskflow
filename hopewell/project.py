@@ -345,8 +345,19 @@ class Project:
              actor: Optional[str] = None) -> Edge:
         if not self.has_node(from_id):
             raise FileNotFoundError(f"node not found: {from_id}")
+        # `references` (HW-0033) may point back at a node id OR a spec-file
+        # path (e.g. a comment-review promoted from a comment on specs/x.md).
+        # Only enforce node existence when the target looks like a node id.
         if kind in (EdgeKind.blocks, EdgeKind.parent, EdgeKind.related) and not self.has_node(to_id):
             raise FileNotFoundError(f"node not found: {to_id}")
+        if kind == EdgeKind.references:
+            try:
+                parse_node_id(to_id)
+                looks_like_node = True
+            except ValueError:
+                looks_like_node = False
+            if looks_like_node and not self.has_node(to_id):
+                raise FileNotFoundError(f"node not found: {to_id}")
 
         # v0.6.1: cycle detection — blocks edges are the only execution-ordering
         # constraint, so they're the only kind that can create execution cycles.
@@ -372,6 +383,9 @@ class Project:
         elif kind == EdgeKind.related:
             if to_id not in src.related:
                 src.related.append(to_id)
+        elif kind == EdgeKind.references:
+            if to_id not in src.references:
+                src.references.append(to_id)
         elif kind == EdgeKind.produces:
             src.outputs.append(NodeOutput(path=to_id, kind=artifact or "artifact"))
         elif kind == EdgeKind.consumes:
