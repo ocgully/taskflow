@@ -537,10 +537,26 @@ const PACKET_DURATION_MS = 2400;
 function InnerCanvas({ onSelect, journeyId, journeyBus,
                        network, layout, packets, setPackets,
                        packetDots, setPacketDots, paused, setPaused,
-                       journey, error }) {
+                       journey, error,
+                       collapsedTouched, setCollapsedTouched,
+                       collapsedLayout }) {
   const [selected, setSelected] = useState(null);
   const [tickFrame, setTickFrame] = useState(0);
   const rf = useReactFlow();
+
+  // When collapsed-touched mode is active AND we have a journey, swap in
+  // the reduced layout so computeLayout re-ran ELK on the visited subset.
+  // Falls back to the full layout if either precondition is missing.
+  const activeLayout = (collapsedTouched && journey && journey.visited && journey.visited.length > 0 && collapsedLayout)
+    ? collapsedLayout
+    : layout;
+  // When collapsed, hide executors/routes not in the visited set from
+  // rfNodes/rfEdges computation below.
+  const visitedSet = useMemo(
+    () => new Set(journey?.visited || []),
+    [journey],
+  );
+  const showOnlyVisited = !!(collapsedTouched && journey && visitedSet.size > 0);
 
   // Edge-hover highlight is applied via direct DOM classList toggling,
   // NOT React state. Reason: a state-driven version (setHoveredEdge ->
@@ -593,9 +609,12 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
 
   // Build React Flow nodes from network + layout.
   const rfNodes = useMemo(() => {
-    if (!network || !layout) return [];
-    return network.executors.map((ex) => {
-      const pos = layout.positions[ex.id] || { x: 0, y: 0, width: 180, height: 52 };
+    if (!network || !activeLayout) return [];
+    const execs = showOnlyVisited
+      ? network.executors.filter((ex) => visitedSet.has(ex.id))
+      : network.executors;
+    return execs.map((ex) => {
+      const pos = activeLayout.positions[ex.id] || { x: 0, y: 0, width: 180, height: 52 };
       const kind = dominantKind(ex.components);
       const slot = packets.by_executor[ex.id] || {};
       return {
@@ -616,7 +635,7 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
         },
       };
     });
-  }, [network, layout, packets, activityByExec, journeyNodes]);
+  }, [network, activeLayout, packets, activityByExec, journeyNodes, showOnlyVisited, visitedSet]);
 
   // Build React Flow edges from routes.
   //
@@ -634,14 +653,20 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
   // This guarantees no two edges share a handle on either end (up to 5
   // per side) and produces a clean fan-out that mimics cable-routing.
   const rfEdges = useMemo(() => {
-    if (!network || !layout) return [];
-    const backEdges = layout.backEdges || new Set();
-    const pos = layout.positions;
+    if (!network || !activeLayout) return [];
+    const backEdges = activeLayout.backEdges || new Set();
+    const pos = activeLayout.positions;
+    // When collapsed, only edges where both endpoints survived the
+    // filter contribute — otherwise the handle-distribution pass would
+    // try to place anchors on nonexistent nodes.
+    const routesIn = showOnlyVisited
+      ? network.routes.filter((r) => visitedSet.has(r.from) && visitedSet.has(r.to))
+      : network.routes;
 
     // Per-node outgoing/incoming edges with centroid-y of the opposite end.
     const outgoing = new Map();   // sourceId -> [{key, idx, targetCy}]
     const incoming = new Map();   // targetId -> [{key, idx, sourceCy}]
-    network.routes.forEach((r, idx) => {
+    routesIn.forEach((r, idx) => {
       const key = `${r.from}|${r.to}`;
       const sp = pos[r.from];
       const tp = pos[r.to];
@@ -670,7 +695,7 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
     for (const [src, edges] of outgoing) assign(sourceHandleFor, edges, "s");
     for (const [tgt, edges] of incoming) assign(targetHandleFor, edges, "t");
 
-    return network.routes.map((r, i) => {
+    return routesIn.map((r, i) => {
       const route = r || {};
       const required = !!route.required;
       const forbidden = !!route.forbidden;
@@ -730,7 +755,7 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
         data: { route, key, isBack },
       };
     });
-  }, [network, layout, journeyEdges]);
+  }, [network, activeLayout, journeyEdges, showOnlyVisited, visitedSet]);
 
   // RAF pulse while any packet is in flight, so we re-render position
   // frames. React Flow edges are the stable substrate; the packets are
@@ -800,11 +825,34 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       "No flow network yet. Run `hopewell network init && hopewell network defaults bootstrap`.");
   }
   if (!layout) return h("div", { class: "muted" }, "Computing layout…");
+  if (showOnlyVisited && !collapsedLayout) {
+    // Filtered layout is still being computed (fires when the toggle
+    // flips on). Keep showing the full-network layout in the meantime
+    // rather than flashing a blank canvas — activeLayout falls back to
+    // `layout` here.
+  }
 
-  const detailPanel = renderInlineDetail({
-    selected, network, packets, onSelect,
-    onJumpItem: (id) => onSelect && onSelect(id),
-  });
+  // Journey-mode sidebar takes priority over executor/edge detail so
+  // users see the chronological event log while the overlay is armed.
+  const journeyPanel = journey
+    ? renderJourneyPanel({
+        journey,
+        network,
+        onSelectEvent: (executorId) => {
+          if (!executorId) return;
+          const el = document.querySelector(
+            `.fx-canvas .react-flow__node[data-id="${CSS.escape(executorId)}"]`);
+          if (el && rf.fitView) {
+            rf.fitView({ padding: 0.4, duration: 350, nodes: [{ id: executorId }] });
+          }
+        },
+      })
+    : null;
+  const detailPanel = journeyPanel
+    || renderInlineDetail({
+      selected, network, packets, onSelect,
+      onJumpItem: (id) => onSelect && onSelect(id),
+    });
 
   return h("div", { class: "fx-canvas", tabIndex: 0 },
     // Toolbar.
@@ -816,6 +864,13 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
         title: "Fit view" }, "fit"),
       h("span", { class: "fx-toolbar-hint muted" },
         `${network.executors.length} nodes | ${network.routes.length} edges`),
+      journeyId && h("button", {
+        class: "fx-toolbar-toggle" + (collapsedTouched ? " fx-toolbar-toggle-on" : ""),
+        title: collapsedTouched
+          ? "Showing only visited executors — click to restore full network"
+          : "Collapse canvas to only the executors this item visited",
+        onClick: () => setCollapsedTouched && setCollapsedTouched(!collapsedTouched),
+      }, collapsedTouched ? "[x] collapsed" : "[ ] collapse to visited"),
       journeyId && h("span", { class: "fx-toolbar-journey" },
         `journey: ${journeyId}`,
         h("button", { class: "fx-toolbar-clear",
@@ -916,6 +971,17 @@ export function CanvasView({ onSelect, journeyId, journeyBus }) {
   const [paused, setPaused]   = useState(false);
   const [journey, setJourney] = useState(null);
   const [error, setError]     = useState(null);
+  // HW-0035: collapsed-touched view mode — when ON, canvas hides all
+  // executors the item did NOT visit. `collapsedLayout` is ELK re-run
+  // on the reduced subgraph so positions stay tight (we don't just
+  // filter + keep full-graph positions, which would leave big empty
+  // gaps where filtered nodes used to sit).
+  const [collapsedTouched, setCollapsedTouched] = useState(false);
+  const [collapsedLayout, setCollapsedLayout]   = useState(null);
+  // Auto-disable when the journey clears — avoids an orphaned toggle.
+  useEffect(() => {
+    if (!journeyId) setCollapsedTouched(false);
+  }, [journeyId]);
 
   // Initial network + packets fetch.
   useEffect(() => {
@@ -980,12 +1046,30 @@ export function CanvasView({ onSelect, journeyId, journeyBus }) {
     return () => { cancel = true; };
   }, [journeyId]);
 
+  // Re-run ELK on the visited subset when collapsed-touched is armed.
+  // Filtering keeps the same computeLayout pipeline (back-edge detection,
+  // diagonal shear, FIRST/LAST_SEPARATE seeding) so the reduced view
+  // inherits every HW-0042 feature on the filtered nodes.
+  useEffect(() => {
+    if (!collapsedTouched || !network || !journey) { setCollapsedLayout(null); return; }
+    const visited = new Set(journey.visited || []);
+    if (visited.size === 0) { setCollapsedLayout(null); return; }
+    const execs  = network.executors.filter((ex) => visited.has(ex.id));
+    const routes = network.routes.filter((r) => visited.has(r.from) && visited.has(r.to));
+    let cancel = false;
+    computeLayout(execs, routes)
+      .then((l) => { if (!cancel) setCollapsedLayout(l); })
+      .catch((e) => { console.error("collapsed layout failed", e); if (!cancel) setCollapsedLayout(null); });
+    return () => { cancel = true; };
+  }, [collapsedTouched, network, journey]);
+
   return h(ReactFlowProvider, null,
     h(InnerCanvas, {
       onSelect, journeyId, journeyBus,
       network, layout, packets, setPackets,
       packetDots, setPacketDots, paused, setPaused,
       journey, error,
+      collapsedTouched, setCollapsedTouched, collapsedLayout,
     }),
   );
 }
@@ -1067,4 +1151,72 @@ function renderInlineDetail({ selected, network, packets, onSelect, onJumpItem }
     );
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Journey panel (HW-0035) — chronological event log for the traced item.
+// Replaces the executor/edge detail panel while an item journey is armed.
+// Rows are clickable: click an event row to scroll the canvas to the
+// executor the event happened at (fitView on that specific node).
+// ---------------------------------------------------------------------------
+
+function _shortKind(k) { return (k || "").replace(/^flow\./, ""); }
+
+function renderJourneyPanel({ journey, network, onSelectEvent }) {
+  const events = journey.events || [];
+  const visited = journey.visited || [];
+  // Build a quick id->label lookup so we can show the friendly name.
+  const labelFor = {};
+  for (const ex of (network && network.executors) || []) {
+    labelFor[ex.id] = ex.label || ex.id;
+  }
+
+  return h("aside", { class: "fx-detail fx-detail-journey" },
+    h("div", { class: "fx-detail-head" },
+      h("span", { class: "fx-detail-kind" }, "journey"),
+      h("span", { class: "fx-detail-id" }, journey.node_id || "?"),
+    ),
+    h("div", { class: "fx-detail-label" },
+      `${events.length} event(s), ${visited.length} executor(s)`),
+    h("div", { class: "fx-detail-section" },
+      h("div", { class: "fx-detail-heading" }, "visited"),
+      h("div", { class: "fx-chips" },
+        visited.length === 0
+          ? h("span", { class: "muted" }, "-- none --")
+          : visited.map((vid, i) =>
+              h("span", { class: "fx-chip fx-chip-visited", key: vid,
+                title: `click to focus ${vid}`,
+                onClick: () => onSelectEvent && onSelectEvent(vid),
+                style: "cursor: pointer" },
+                `${i + 1}. ${labelFor[vid] || vid}`))),
+    ),
+    h("div", { class: "fx-detail-section" },
+      h("div", { class: "fx-detail-heading" }, "event log"),
+      events.length === 0
+        ? h("div", { class: "muted" }, "-- no flow events yet --")
+        : h("ol", { class: "fx-journey-log" },
+            events.map((ev, i) => {
+              const kind = _shortKind(ev.kind);
+              const ex = ev.executor;
+              const frm = ev.from_executor;
+              // Prefer the destination for "scroll to" since that's
+              // where the work lands after the event.
+              const focusTarget = ex || frm;
+              const transition = frm && ex ? `${frm} -> ${ex}` : (ex || frm || "?");
+              return h("li", {
+                class: `fx-journey-row fx-journey-${kind}`,
+                key: `${ev.ts}-${i}`,
+                title: "click to scroll canvas to this executor",
+                onClick: () => onSelectEvent && onSelectEvent(focusTarget),
+              },
+                h("span", { class: "fx-journey-ts" }, ev.ts || ""),
+                h("span", { class: "fx-journey-kind" }, kind),
+                h("span", { class: "fx-journey-where" }, transition),
+                ev.reason && h("span", { class: "fx-journey-reason muted" },
+                  `(${ev.reason})`),
+                ev.artifact && h("span", { class: "fx-journey-artifact muted" },
+                  `artifact=${ev.artifact}`),
+              );
+            }))),
+  );
 }
