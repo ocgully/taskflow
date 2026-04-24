@@ -242,6 +242,49 @@ def claims(project: Project, node_id: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# cycle-time / quality / queue-staleness (HW-0038)
+# ---------------------------------------------------------------------------
+
+
+def cycle_time(project: Project, node_id: Optional[str] = None, *,
+               component: Optional[str] = None,
+               done_since: Optional[str] = None) -> Dict[str, Any]:
+    """Cycle-time breakdown.
+
+    With `node_id`: per-item breakdown (total/active/wait, first-pass
+    vs rework, by executor).
+    Without `node_id`: aggregate across matching nodes; `component`
+    filters work-item components; `done_since` windows to nodes done
+    at/after the ISO timestamp.
+    """
+    from hopewell import cycle_time as _ct
+    if node_id:
+        return _ct.item_cycle_time(project, node_id)
+    return _ct.aggregate_cycle_time(
+        project, component=component, done_since=done_since,
+    )
+
+
+def quality(project: Project, executor_id: Optional[str] = None, *,
+            since: Optional[str] = None,
+            all_executors: bool = False) -> Dict[str, Any]:
+    """Per-executor rework ratio (active clock). See `hopewell.cycle_time.quality`."""
+    from hopewell import cycle_time as _ct
+    return _ct.quality(project, executor_id, since=since,
+                       all_executors=all_executors)
+
+
+def queue_staleness(project: Project, *,
+                    threshold: Optional[str] = None) -> Dict[str, Any]:
+    """Queue-health signal. See `hopewell.cycle_time.queue_staleness`."""
+    from hopewell import cycle_time as _ct
+    return _ct.queue_staleness(project, threshold=threshold)
+
+
+# ---------------------------------------------------------------------------
+
+
 def graph(project: Project) -> Dict[str, Any]:
     nodes = project.all_nodes()
     edges: List[Dict[str, Any]] = []
