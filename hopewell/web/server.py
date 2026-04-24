@@ -443,6 +443,246 @@ def create_app(project_root: Path):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    # ---- Network (flow-map) endpoints — HW-0029 -------------------------
+    #
+    # These expose the flow network (executors + routes) plus live packet
+    # state to the Canvas tab. Layout overrides persist to
+    # `.hopewell/network/layout.json` — created/updated by the UI at
+    # runtime, NOT committed to the repo.
+
+    def _layout_path() -> Path:
+        return project_root / ".hopewell" / "network" / "layout.json"
+
+    def _load_layout() -> Dict[str, Any]:
+        lp = _layout_path()
+        if not lp.is_file():
+            return {"positions": {}, "updated": None}
+        try:
+            data = json.loads(lp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"positions": {}, "updated": None}
+            data.setdefault("positions", {})
+            return data
+        except (OSError, json.JSONDecodeError):
+            return {"positions": {}, "updated": None}
+
+    @app.get("/api/network")
+    def _network() -> Dict[str, Any]:
+        """Flow network JSON: executors + routes + saved layout overrides.
+
+        Shape:
+            {
+              "executors": [ {id, components, component_data, parent, label, ...}, ... ],
+              "routes":    [ {from, to, condition, required, label}, ... ],
+              "layout":    { "positions": { "<id>": {"x": n, "y": n}, ... } }
+            }
+        """
+        from hopewell import network as net_mod
+        try:
+            net = net_mod.load_network(project_root)
+            payload = net_mod.to_json(net)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to load network: {e}")
+        payload["layout"] = _load_layout()
+        return payload
+
+    @app.get("/api/packets")
+    def _packets() -> Dict[str, Any]:
+        """Live packet state per executor.
+
+        Returns, for every executor, the pending inbox (pushed but not
+        yet acked) and the active locations (work items currently
+        "inside" that executor). Plus a flat list of items currently
+        in-flight (push seen, no matching ack yet).
+
+        Shape:
+            {
+              "by_executor": {
+                "@engineer": {
+                  "inbox_depth": 2,
+                  "active_depth": 1,
+                  "inbox":    [ {node, pushed_at, from_executor, ...} ],
+                  "active":   [ {node_id, entered_at, last_artifact} ]
+                }, ...
+              },
+              "in_flight": [ {node, from_executor, to_executor, pushed_at}, ... ]
+            }
+        """
+        from hopewell import network as net_mod
+        from hopewell import flow as flow_mod
+        from hopewell import events as events_mod
+
+        p = _load_project(project_root)
+        net = net_mod.load_network(project_root)
+        by_executor: Dict[str, Dict[str, Any]] = {}
+        for eid in net.executors.keys():
+            inbox_items = flow_mod.inbox(p, eid)
+            by_executor[eid] = {
+                "inbox_depth": len(inbox_items),
+                "active_depth": 0,
+                "inbox": inbox_items,
+                "active": [],
+            }
+
+        # Active locations come from work-item node files.
+        for node in p.all_nodes():
+            for loc in getattr(node, "locations", []) or []:
+                if loc.left_at is not None:
+                    continue
+                slot = by_executor.get(loc.executor_id)
+                if slot is None:
+                    continue
+                slot["active"].append({
+                    "node_id": node.id,
+                    "title": node.title,
+                    "entered_at": loc.entered_at,
+                    "last_artifact": loc.last_artifact,
+                })
+                slot["active_depth"] += 1
+
+        # In-flight: any flow.push without a matching flow.ack (per-node FIFO).
+        # The logic mirrors flow.inbox() but we record the edge, not the queue.
+        in_flight: List[Dict[str, Any]] = []
+        try:
+            events = events_mod.read_all(p.events_path)
+        except Exception:
+            events = []
+        # Per (node, to_executor) outstanding pushes.
+        pending: Dict[str, List[Dict[str, Any]]] = {}
+        for ev in events:
+            kind = ev.get("kind")
+            data = ev.get("data") or {}
+            nid = ev.get("node")
+            if kind == "flow.push" and nid:
+                to_ex = data.get("to_executor")
+                if not to_ex:
+                    continue
+                pending.setdefault(f"{nid}|{to_ex}", []).append({
+                    "node": nid,
+                    "from_executor": data.get("from_executor"),
+                    "to_executor": to_ex,
+                    "pushed_at": ev.get("ts"),
+                })
+            elif kind == "flow.ack" and nid:
+                ex = data.get("executor")
+                if not ex:
+                    continue
+                q = pending.get(f"{nid}|{ex}")
+                if q:
+                    q.pop(0)
+        for q in pending.values():
+            in_flight.extend(q)
+        in_flight.sort(key=lambda e: e.get("pushed_at") or "")
+
+        return {"by_executor": by_executor, "in_flight": in_flight}
+
+    @app.get("/api/items/{node_id}/journey")
+    def _item_journey(node_id: str) -> Dict[str, Any]:
+        """Traversal events for one work item (chronological).
+
+        Shape:
+            {
+              "node_id": "HW-0029",
+              "events":  [ {ts, kind, executor, from, to, reason, artifact}, ... ],
+              "visited": [ "<executor_id>", ... ]   # ordered, de-duped
+            }
+        """
+        from hopewell import events as events_mod
+        p = _load_project(project_root)
+        if not p.has_node(node_id):
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+        try:
+            events = events_mod.read_all(p.events_path)
+        except Exception:
+            events = []
+        journey: List[Dict[str, Any]] = []
+        visited: List[str] = []
+        seen: set = set()
+        flow_kinds = {"flow.push", "flow.ack", "flow.enter", "flow.leave"}
+        for ev in events:
+            if ev.get("kind") not in flow_kinds:
+                continue
+            if ev.get("node") != node_id:
+                continue
+            data = ev.get("data") or {}
+            entry: Dict[str, Any] = {
+                "ts": ev.get("ts"),
+                "kind": ev.get("kind"),
+            }
+            # Normalise executor fields so the client doesn't need to know
+            # which key each event-kind uses.
+            exec_id = data.get("executor") or data.get("to_executor")
+            from_id = data.get("from_executor")
+            if exec_id:
+                entry["executor"] = exec_id
+            if from_id:
+                entry["from_executor"] = from_id
+            if data.get("reason"):
+                entry["reason"] = data["reason"]
+            if data.get("artifact"):
+                entry["artifact"] = data["artifact"]
+            journey.append(entry)
+            # Add to visited path.
+            for candidate in (from_id, exec_id):
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    visited.append(candidate)
+        return {"node_id": node_id, "events": journey, "visited": visited}
+
+    @app.post("/api/network/layout")
+    async def _save_layout(request: Request) -> Dict[str, Any]:
+        """Persist manual node positions to `.hopewell/network/layout.json`.
+
+        Body: `{ "positions": { "<executor_id>": {"x": n, "y": n}, ... } }`
+        — we merge into the existing layout so the UI can send one
+        position at a time (drag-to-persist without a full resync).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        patch = body.get("positions") or {}
+        if not isinstance(patch, dict):
+            raise HTTPException(status_code=400, detail="`positions` must be an object")
+
+        current = _load_layout()
+        positions = dict(current.get("positions") or {})
+        for eid, pos in patch.items():
+            if pos is None:
+                positions.pop(eid, None)
+                continue
+            if not isinstance(pos, dict):
+                continue
+            try:
+                positions[eid] = {
+                    "x": float(pos.get("x")),
+                    "y": float(pos.get("y")),
+                }
+            except (TypeError, ValueError):
+                continue
+        out = {
+            "positions": positions,
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        lp = _layout_path()
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8")
+        return {"ok": True, "layout": out}
+
+    @app.post("/api/network/layout/reset")
+    def _reset_layout() -> Dict[str, Any]:
+        """Delete all manual overrides. Next canvas load uses dagre auto-layout."""
+        lp = _layout_path()
+        try:
+            if lp.is_file():
+                lp.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"failed to reset: {e}")
+        return {"ok": True, "layout": {"positions": {}, "updated": None}}
+
     # ---- SSE ------------------------------------------------------------
     @app.get("/api/events")
     async def _events(request: Request):
