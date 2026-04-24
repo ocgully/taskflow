@@ -93,7 +93,8 @@ class Project:
 
     @classmethod
     def init(cls, root: Path, *, id_prefix: str = "HW", name: Optional[str] = None,
-             overwrite_claudemd: bool = False) -> "Project":
+             overwrite_claudemd: bool = False,
+             auto_backfill: bool = True) -> "Project":
         root = root.resolve()
         paths.ensure_hw_dir(root)
         hw = paths.hw_dir(root)
@@ -154,7 +155,21 @@ class Project:
         else:
             meta_mod.write_for_init(hw)
 
-        return cls.load(root)
+        project = cls.load(root)
+
+        # HW-0049: auto-backfill on fresh init when sources are discoverable.
+        # Entirely delegated to backfill.maybe_backfill_on_init so init() stays
+        # readable and the policy lives in one place. Import is lazy to avoid
+        # load-time cycles.
+        if auto_backfill and not already_initialized:
+            try:
+                from hopewell import backfill as _backfill_mod
+                _backfill_mod.maybe_backfill_on_init(project, enabled=True)
+            except Exception as exc:  # noqa: BLE001 — never block init on backfill
+                events.append(project.events_path, "project.backfill.error",
+                              data={"error": f"{type(exc).__name__}: {exc}"})
+
+        return project
 
     @classmethod
     def migrate(cls, start: Optional[Path] = None) -> "Project":

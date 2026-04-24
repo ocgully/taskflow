@@ -100,11 +100,23 @@ def _actor_from_env() -> Optional[str]:
 def cmd_init(args) -> int:
     from hopewell.project import Project
     root = Path(args.project_root).resolve() if args.project_root else Path.cwd()
-    project = Project.init(root, id_prefix=args.prefix, name=args.name)
+    auto_backfill = not getattr(args, "no_backfill", False)
+    project = Project.init(root, id_prefix=args.prefix, name=args.name,
+                           auto_backfill=auto_backfill)
     if not args.quiet:
         print(f"Initialized {project.hw_dir}")
         print(f"  project name: {project.cfg.name}")
         print(f"  id_prefix:    {project.cfg.id_prefix}")
+        # Surface backfill outcome if it ran
+        ledger = project.hw_dir / "backfill-sources.jsonl"
+        if auto_backfill and ledger.is_file():
+            try:
+                n = sum(1 for _ in ledger.open(encoding="utf-8"))
+                if n:
+                    print(f"  backfill:     {n} source record(s) ingested "
+                          "(see `hopewell list`)")
+            except OSError:
+                pass
         print("  next steps:   `hopewell new --components work-item --title \"...\"`")
     return 0
 
@@ -919,7 +931,34 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prefix", default="HW")
     sp.add_argument("--name", default=None)
     sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--no-backfill", action="store_true",
+                    help="Skip auto-backfill on init (default: auto-fire if "
+                         "the project has git history or discoverable sources)")
     sp.set_defaults(func=cmd_init)
+
+    # backfill (HW-0049)
+    from hopewell import backfill_cli as _backfill_cli_mod
+    sp = sub.add_parser(
+        "backfill",
+        help="Populate .hopewell/nodes/ from git history / issues / TODO / specs",
+    )
+    sp.add_argument(
+        "--source", default="git,todo,spec",
+        help="Comma-separated: git | issues | todo | spec | all "
+             "(default: git,todo,spec — issues is opt-in)",
+    )
+    sp.add_argument("--since", default=None,
+                    help="ISO date; commits/issues older are ignored "
+                         "(default: 180 days ago)")
+    sp.add_argument("--github", action="store_true",
+                    help="Include GitHub issues via `gh` CLI (implies --source issues)")
+    sp.add_argument("--github-repo", default=None,
+                    help="owner/name (defaults to gh's autodetection)")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--limit", type=int, default=None,
+                    help="Cap commits scanned (safety valve)")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
+    sp.set_defaults(func=_backfill_cli_mod.cmd_backfill)
 
     # new
     sp = sub.add_parser("new", help="Create a new node")
