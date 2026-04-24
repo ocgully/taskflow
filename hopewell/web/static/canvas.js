@@ -394,11 +394,29 @@ async function computeLayout(executors, routes) {
   };
 
   const res = await elk.layout(graph);
+
+  // Diagonal shear — bias later-in-flow nodes further DOWN as well as
+  // right, so top-left = flow origin, bottom-right = flow terminus.
+  // Each rank's x translates into an additional y offset; within a
+  // rank nodes retain their relative vertical ordering but the whole
+  // column slides down.
+  const DIAGONAL_SLOPE = 0.35;
+  let minX = Infinity;
+  for (const c of res.children || []) minX = Math.min(minX, c.x || 0);
+  if (!isFinite(minX)) minX = 0;
+
   const positions = {};
   for (const c of res.children || []) {
-    positions[c.id] = { x: c.x || 0, y: c.y || 0, width: c.width, height: c.height };
+    const dx = (c.x || 0) - minX;
+    positions[c.id] = {
+      x: c.x || 0,
+      y: (c.y || 0) + dx * DIAGONAL_SLOPE,
+      width: c.width,
+      height: c.height,
+    };
   }
-  return { positions, width: res.width || 800, height: res.height || 600 };
+  const totalHeight = (res.height || 600) + (res.width || 800) * DIAGONAL_SLOPE;
+  return { positions, width: res.width || 800, height: totalHeight };
 }
 
 // ---------------------------------------------------------------------------
