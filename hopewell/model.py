@@ -300,6 +300,37 @@ BUILTIN_COMPONENTS: List[Component] = [
         required_fields=["consumer_node", "spec_path"],
     ),
     Component(
+        name="release",
+        description=(
+            "Release record (HW-0043). Represents a cut / candidate cut "
+            "of a versioned bundle of work. Owns scope (the set of "
+            "work-item nodes included), a confidence score, a "
+            "standardized report, and the final-gate outcome (draft, "
+            "held, released, kicked-back). See `hopewell.release` + "
+            "the `hopewell release ...` CLI, and the @release-engineer "
+            "core agent doc for workflow context."
+        ),
+        schema={
+            "version":          "string (project-defined; e.g. v0.15.0)",
+            "scope_nodes":      "array of node ids included in this release",
+            "confidence_score": "integer 0-100 (persisted at finalize)",
+            "report_path":      "string (relative, e.g. .hopewell/releases/v0.15.0.md)",
+            "tag":              "string (git tag created on finalize, if any)",
+            "released_at":      "iso-ts (set on successful finalize)",
+            "released_by":      "string (agent or human handle)",
+            "status":           "enum: draft | held | released | kicked-back",
+            "kickback":         (
+                "optional object {root_cause, affected, route_to, "
+                "rework_node, created_at} populated on kickback"
+            ),
+            "score_breakdown":  (
+                "optional array of {name, weight, score, justification} "
+                "— persisted on finalize for audit"
+            ),
+        },
+        required_fields=["version"],
+    ),
+    Component(
         name="comment-review",
         description=(
             "Review node promoted from a comment thread (HW-0033). "
