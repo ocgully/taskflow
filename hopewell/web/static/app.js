@@ -9,6 +9,28 @@ import { useState, useEffect, useMemo, useRef, useCallback }
   from "https://esm.sh/preact@10.22.0/hooks";
 import { marked } from "https://esm.sh/marked@12.0.2";
 import { CanvasView } from "/static/canvas.js";
+import { DocViewer } from "/static/viewer.js";
+
+// ---------------------------------------------------------------------------
+// URL-hash route helpers (HW-0032 viewer deep-link: #/doc/<NODE_ID>)
+// ---------------------------------------------------------------------------
+
+const DOC_HASH_RE = /^#\/doc\/([^/?#]+)/;
+
+function parseDocHash(hashStr) {
+  const m = (hashStr || "").match(DOC_HASH_RE);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function setDocHash(nodeId) {
+  const want = nodeId ? `#/doc/${encodeURIComponent(nodeId)}` : "#";
+  if (location.hash !== want) {
+    // replaceState avoids polluting history during rapid nav; leave
+    // back-button support for user-initiated open/close.
+    if (nodeId) location.hash = want;
+    else history.replaceState(null, "", location.pathname + location.search + "#");
+  }
+}
 
 // Markdown renderer config: GFM on, line breaks on, no raw HTML passthrough.
 // marked escapes HTML by default when `mangle`/`headerIds` aren't configured;
@@ -91,6 +113,7 @@ function App() {
   const [tab, setTab] = useState("canvas");     // HW-0029: canvas is the prominent default.
   const [detailId, setDetailId] = useState(null);
   const [journeyId, setJourneyId] = useState(null);   // HW-0029: item-journey overlay
+  const [viewerId, setViewerId] = useState(null);    // HW-0032: md viewer modal
   const [sseOk, setSseOk] = useState(false);
   const [lastEvent, setLastEvent] = useState("no events yet");
   const [error, setError] = useState(null);
@@ -164,9 +187,35 @@ function App() {
   //     the work item's path through the flow network (HW-0029 criterion
   //     "clicking a work item anywhere in the UI highlights its path on
   //     the canvas as a colored trail").
+  // HW-0032: clicking a node ID opens the markdown doc viewer as a modal
+  // (with #/doc/<id> hash for deep-linking) AND arms the journey overlay.
+  // The Detail sidebar (old UX) is reachable from the viewer's "sidebar
+  // detail" link, or programmatically via onOpenDetail; keeping both so
+  // features like UAT actions in the sidebar remain accessible.
   const onSelect = useCallback((id) => {
-    setDetailId(id);
     setJourneyId(id);
+    setDetailId(id);     // keep Detail sidebar in sync (UAT actions live there)
+    setViewerId(id);
+    setDocHash(id);
+  }, []);
+
+  // HW-0032 — hash route: #/doc/<NODE_ID> opens the markdown viewer modal.
+  // Initial load + every hashchange syncs viewerId to the hash.
+  useEffect(() => {
+    const sync = () => setViewerId(parseDocHash(location.hash));
+    sync();
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+
+  const openViewer = useCallback((id) => {
+    setViewerId(id);
+    setDocHash(id);
+  }, []);
+
+  const closeViewer = useCallback(() => {
+    setViewerId(null);
+    setDocHash(null);
   }, []);
 
   return h(Fragment, null,
@@ -183,7 +232,13 @@ function App() {
     detailId && h(Detail, {
       id: detailId,
       onSelect,
+      onOpenViewer: openViewer,
       onClose: () => setDetailId(null),
+    }),
+    viewerId && h(DocViewer, {
+      nodeId: viewerId,
+      onClose: closeViewer,
+      onSelectNode: (id) => openViewer(id),
     }),
   );
 }
@@ -824,7 +879,7 @@ function Markdown({ text }) {
 
 // --- Detail panel -----------------------------------------------------------
 
-function Detail({ id, onSelect, onClose }) {
+function Detail({ id, onSelect, onOpenViewer, onClose }) {
   const [node, setNode] = useState(null);
   const [err, setErr] = useState(null);
 
@@ -873,6 +928,13 @@ function Detail({ id, onSelect, onClose }) {
         h("span", { class: "det-id" }, node.id),
         " — ",
         h("span", { class: "det-title" }, node.title),
+      ),
+      onOpenViewer && h("div", { class: "det-actions" },
+        h("button", {
+          class: "det-view-doc",
+          onClick: () => onOpenViewer(node.id),
+          title: "Open full markdown viewer (#/doc/" + node.id + ")",
+        }, "Open doc viewer →"),
       ),
 
       // Core metadata grid.

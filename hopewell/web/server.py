@@ -167,6 +167,21 @@ class EventsTailer:
 # ---------------------------------------------------------------------------
 
 
+def _slice_key(path: Optional[str], anchor: Optional[str],
+               lines: Optional[List[int]]) -> str:
+    """Compose a stable key for a slice so ref metadata + drift can be joined.
+
+    Mirrors `spec_input._slice_match` comparison semantics (anchor wins
+    over lines if present). Kept lightweight — just enough to look up an
+    entry computed from `drift()`.
+    """
+    if anchor:
+        return f"{path or ''}|a:{anchor.strip()}"
+    if lines and len(lines) >= 2:
+        return f"{path or ''}|l:{int(lines[0])}-{int(lines[1])}"
+    return f"{path or ''}|?"
+
+
 def _load_project(project_root: Path):
     """Load a Hopewell project, surface a readable error if `.hopewell/` is absent."""
     from hopewell.project import Project
@@ -266,6 +281,224 @@ def create_app(project_root: Path):
             return query_mod.show(p, node_id)["node"]
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+
+    # ---- Markdown-viewer endpoints (HW-0032) ----------------------------
+    #
+    # Three routes power the viewer:
+    #   GET /api/doc/{node_id}       — raw node .md + metadata
+    #   GET /api/spec?path=...       — raw spec file + the slices recorded
+    #                                  for it across all nodes + drift per
+    #                                  consumer so the viewer can render
+    #                                  drift badges without extra calls.
+    #   POST /api/node/{node_id}/spec-repin — re-record slice hash against
+    #                                  current file content (idempotent add).
+    #
+    # Path safety: all filesystem reads are anchored to project_root via
+    # `_resolve_project_rel_path`, which refuses anything that escapes the
+    # repo via `..` or an absolute path. Spec files can live anywhere
+    # under the project root (not just inside .hopewell/).
+
+    def _resolve_project_rel_path(rel: str) -> Path:
+        """Resolve `rel` against the project root, refusing path traversal.
+
+        Raises HTTPException(400) on traversal attempts and HTTPException(404)
+        if the resolved path is not a readable file.
+        """
+        if not rel or not isinstance(rel, str):
+            raise HTTPException(status_code=400, detail="path required")
+        # Reject absolute paths outright.
+        candidate = Path(rel)
+        if candidate.is_absolute():
+            raise HTTPException(status_code=400, detail="absolute paths not allowed")
+        resolved = (project_root / candidate).resolve()
+        try:
+            resolved.relative_to(project_root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="path escapes project root")
+        if not resolved.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {rel}")
+        return resolved
+
+    @app.get("/api/doc/{node_id}")
+    def _doc(node_id: str) -> Dict[str, Any]:
+        """Return the raw node .md contents + a compact node summary.
+
+        The viewer renders the full markdown (body + notes) client-side so
+        fenced code blocks (mermaid / plantuml) render inline. Spec refs
+        are returned pre-expanded so the viewer can render slice overlays
+        without a second roundtrip per reference.
+        """
+        from hopewell import query as query_mod
+        from hopewell import spec_input as spec_mod
+        p = _load_project(project_root)
+        try:
+            node_summary = query_mod.show(p, node_id)["node"]
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+
+        node_md_path = p.node_path(node_id)
+        try:
+            md_text = node_md_path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"cannot read node file: {e}")
+
+        # Enumerate spec refs with drift so the viewer can render badges inline.
+        try:
+            refs = spec_mod.ls_spec_refs(p, node_id)
+        except Exception:
+            refs = []
+        drift_entries: List[Dict[str, Any]] = []
+        try:
+            drift_entries = spec_mod.drift(p, node_id, patch=True)
+        except Exception:
+            drift_entries = []
+        # Index drift by (path, anchor, lines-tuple) so refs can lookup.
+        drift_by_key: Dict[str, Dict[str, Any]] = {}
+        for d in drift_entries:
+            key = _slice_key(d.get("path"), d.get("anchor"), d.get("lines_was"))
+            drift_by_key[key] = d
+
+        spec_refs_out: List[Dict[str, Any]] = []
+        for r in refs:
+            key = _slice_key(r.get("path"), r.get("anchor"), r.get("lines"))
+            d = drift_by_key.get(key, {})
+            spec_refs_out.append({
+                "path": r.get("path"),
+                "anchor": r.get("anchor"),
+                "lines": r.get("lines"),
+                "slice_sha": r.get("slice_sha"),
+                "why": r.get("why"),
+                "state": d.get("state") or "unknown",
+                "lines_now": d.get("lines_now"),
+                "slice_sha_now": d.get("slice_sha_now"),
+                "patch": d.get("patch"),
+            })
+
+        return {
+            "node": node_summary,
+            "node_md_path": str(node_md_path.relative_to(project_root)).replace("\\", "/"),
+            "markdown": md_text,
+            "spec_refs": spec_refs_out,
+        }
+
+    @app.get("/api/spec")
+    def _spec(path: str) -> Dict[str, Any]:
+        """Return a spec file's text + the slices any nodes have pinned on it.
+
+        The viewer renders only the pinned line ranges by default and uses
+        the `text` payload for expand-context-on-click. Line numbers in
+        the response are 1-based inclusive to match `spec_input.py`.
+
+        Shape:
+            {
+              "path": "specs/002/spec.md",
+              "text": "...full file text...",
+              "line_count": N,
+              "consumers": [
+                { "node": "SM-0001", "title": "...", "status": "doing",
+                  "slices": [ {anchor, lines, slice_sha, why,
+                               state, lines_now, slice_sha_now, patch} ] }
+              ]
+            }
+        """
+        from hopewell import spec_input as spec_mod
+        p = _load_project(project_root)
+        resolved = _resolve_project_rel_path(path)
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"cannot read file: {e}")
+
+        # Normalise path for storage comparison (matches spec_input._normalise_path).
+        rel_posix = str(resolved.relative_to(project_root)).replace("\\", "/")
+
+        # Consumers of this spec (any slice).
+        try:
+            consumers_list = spec_mod.consumers(p, rel_posix)
+        except Exception:
+            consumers_list = []
+
+        # For each consumer, compute per-slice drift.
+        for c in consumers_list:
+            try:
+                drift_entries = spec_mod.drift(p, c["node"], patch=True)
+            except Exception:
+                drift_entries = []
+            dbk: Dict[str, Dict[str, Any]] = {}
+            for d in drift_entries:
+                if d.get("path") != rel_posix:
+                    continue
+                k = _slice_key(d.get("path"), d.get("anchor"), d.get("lines_was"))
+                dbk[k] = d
+            for sl in c.get("slices", []):
+                k = _slice_key(rel_posix, sl.get("anchor"), sl.get("lines"))
+                d = dbk.get(k, {})
+                sl["state"] = d.get("state") or "unknown"
+                sl["lines_now"] = d.get("lines_now")
+                sl["slice_sha_now"] = d.get("slice_sha_now")
+                sl["patch"] = d.get("patch")
+
+        # Split lines for fast client-side slicing (also gives accurate count).
+        lines = text.split("\n")
+        # Keep trailing newline handling consistent with spec_input.
+        if lines and lines[-1] == "":
+            lines.pop()
+
+        return {
+            "path": rel_posix,
+            "text": text,
+            "line_count": len(lines),
+            "consumers": consumers_list,
+        }
+
+    @app.post("/api/node/{node_id}/spec-repin")
+    async def _spec_repin(node_id: str, request: Request) -> Dict[str, Any]:
+        """Re-pin a drifted slice against the current file content.
+
+        Body: `{"path": "...", "anchor": "## Heading"}` OR
+              `{"path": "...", "lines": [start, end]}`
+
+        Uses `spec_input.add_spec_ref` which is idempotent — calling it
+        with the same heading/lines updates the recorded hash + lines to
+        whatever the file says now.
+        """
+        from hopewell import spec_input as spec_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        path = body.get("path")
+        if not path:
+            raise HTTPException(status_code=400, detail="`path` required")
+        anchor = body.get("anchor")
+        lines = body.get("lines")
+        lines_tuple: Optional[tuple] = None
+        if lines:
+            try:
+                lines_tuple = (int(lines[0]), int(lines[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400, detail="`lines` must be [start, end]")
+        if not anchor and not lines_tuple:
+            raise HTTPException(status_code=400,
+                                detail="provide `anchor` or `lines`")
+
+        p = _load_project(project_root)
+        try:
+            result = spec_mod.add_spec_ref(
+                p, node_id, path,
+                heading=anchor or None,
+                lines=lines_tuple,
+                why=body.get("why"),
+                actor="@web-ui-viewer",
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404,
+                                detail=f"node or spec not found: {node_id} / {path}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "repin": result}
 
     @app.get("/api/history")
     def _history(limit: int = 50, cursor: int = 0) -> Dict[str, Any]:
