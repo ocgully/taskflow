@@ -283,6 +283,23 @@ def queue_staleness(project: Project, *,
 
 
 # ---------------------------------------------------------------------------
+# markov / rework analytics (HW-0036)
+# ---------------------------------------------------------------------------
+
+
+def markov(project: Project, *, window: str = "30d",
+           include_singletons: bool = True) -> Dict[str, Any]:
+    """Per-edge transition probabilities across all work items.
+
+    See `hopewell.markov.compute` for the full semantics (window
+    resolution, forward-vs-back classification, time-weighted overlay).
+    """
+    from hopewell import markov as _markov
+    return _markov.compute(project, window=window,
+                           include_singletons=include_singletons)
+
+
+# ---------------------------------------------------------------------------
 
 
 def graph(project: Project) -> Dict[str, Any]:

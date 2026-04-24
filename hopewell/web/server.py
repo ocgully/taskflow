@@ -918,6 +918,39 @@ def create_app(project_root: Path):
             raise HTTPException(status_code=500, detail=f"failed to reset: {e}")
         return {"ok": True, "layout": {"positions": {}, "updated": None}}
 
+    # ---- Markov / rework analytics (HW-0036) ----------------------------
+
+    @app.get("/api/markov")
+    def _markov(window: str = "30d", include_singletons: bool = True) -> Dict[str, Any]:
+        """Per-edge transition probabilities across all work items.
+
+        Query params:
+            window             — `all` | `30d` (default) | `7d` | `1d` |
+                                 `release-tag`.
+            include_singletons — count single-traversal items in the
+                                 base-rate total (default True).
+
+        Payload shape (abbreviated — see `hopewell.markov.compute`):
+            {
+              "window": "30d",
+              "total_items": 42, "total_transitions": 157,
+              "rework_events": 12, "rework_ratio": 0.076,
+              "edges": [ {from, to, count, probability, is_back,
+                          mean_dwell_seconds, time_weight_seconds,
+                          classification_source, declared_route}, ... ],
+              "sources": [ {executor, departures, mean_dwell_seconds}, ... ]
+            }
+        """
+        from hopewell import markov as markov_mod
+        p = _load_project(project_root)
+        try:
+            return markov_mod.compute(
+                p, window=window, include_singletons=bool(include_singletons),
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500,
+                                detail=f"markov aggregation failed: {e}")
+
     # ---- SSE ------------------------------------------------------------
     @app.get("/api/events")
     async def _events(request: Request):

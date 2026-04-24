@@ -231,6 +231,7 @@ function App() {
     tab === "timeline" && h(TimelineView, { state, onSelect }),
     tab === "uat"      && h(UatView,      { state, onSelect, reload }),
     tab === "history"  && h(HistoryView,  { onSelect }),
+    tab === "analytics" && h(AnalyticsView, { onSelect }),
     detailId && h(Detail, {
       id: detailId,
       onSelect,
@@ -1005,6 +1006,341 @@ function Detail({ id, onSelect, onOpenViewer, onClose }) {
 
   render(content, body);
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Analytics view — Markov / rework visualisation (HW-0036).
+//
+// Single-panel layout:
+//   * SVG flow-network rendered once by BFS-layering from observed
+//     transitions (simpler than canvas.js; no pan/zoom — analytics is
+//     a reading surface, not a manipulation surface).
+//   * Edge overlays: probability labels, volume-proportional thickness,
+//     forward/back hue.
+//   * Sidebar: window toggle, singleton toggle, time-weighted overlay
+//     toggle, aggregate metrics, and top-N rework table.
+// ---------------------------------------------------------------------------
+
+function AnalyticsView({ onSelect }) {
+  const [window, setWindow] = useState("30d");
+  const [includeSingletons, setIncludeSingletons] = useState(true);
+  const [timeWeighted, setTimeWeighted] = useState(false);
+  const [topBy, setTopBy] = useState("probability");
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const url = `/api/markov?window=${encodeURIComponent(window)}`
+              + `&include_singletons=${includeSingletons ? "true" : "false"}`;
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`/api/markov -> ${r.status}`);
+        return r.json();
+      })
+      .then((d) => { if (!cancelled) { setData(d); setErr(null); } })
+      .catch((e) => { if (!cancelled) { setErr(String(e)); setData(null); } })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [window, includeSingletons]);
+
+  return h("div", { class: "analytics" },
+    h("aside", { class: "mk-sidebar" },
+      h("h3", null, "window"),
+      h("div", { class: "mk-toggle-group" },
+        ["all", "30d", "7d", "release-tag"].map((w) =>
+          h("button", {
+            key: w,
+            class: "mk-tog" + (window === w ? " active" : ""),
+            onClick: () => setWindow(w),
+          }, w)
+        )),
+      h("h3", null, "options"),
+      h("label", { class: "mk-check" },
+        h("input", {
+          type: "checkbox",
+          checked: includeSingletons,
+          onChange: (e) => setIncludeSingletons(e.target.checked),
+        }),
+        " count single-traversal items"),
+      h("label", { class: "mk-check" },
+        h("input", {
+          type: "checkbox",
+          checked: timeWeighted,
+          onChange: (e) => setTimeWeighted(e.target.checked),
+        }),
+        " time-weighted edges (P × mean dwell)"),
+      h("h3", null, "top rework edges"),
+      h("div", { class: "mk-toggle-group" },
+        ["probability", "count", "time_weight"].map((k) =>
+          h("button", {
+            key: k,
+            class: "mk-tog" + (topBy === k ? " active" : ""),
+            onClick: () => setTopBy(k),
+          }, k)
+        )),
+      data && h(MarkovMetrics, { data }),
+      data && h(MarkovRework, { data, topBy, onSelect }),
+    ),
+    h("section", { class: "mk-canvas-wrap" },
+      err && h("div", { class: "empty" }, "Error: " + err),
+      loading && !data && h("div", { class: "empty" }, "Loading analytics..."),
+      data && (data.total_transitions > 0
+        ? h(MarkovGraph, { data, timeWeighted, onSelect })
+        : h("div", { class: "empty" },
+            "No transitions observed in this window. "
+          + "Items need at least two flow enters/leaves to contribute."
+          )),
+    ),
+  );
+}
+
+function MarkovMetrics({ data }) {
+  const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+  return h("div", { class: "mk-metrics" },
+    h("h3", null, "summary"),
+    h("dl", null,
+      h("dt", null, "items"),
+      h("dd", null,
+        `${data.total_items} total`,
+        h("br"),
+        h("span", { class: "muted" },
+          `${data.contributing_items} contributing, `
+          + `${data.singleton_items} single-traversal`)),
+      h("dt", null, "transitions"), h("dd", null, data.total_transitions),
+      h("dt", null, "rework events"),
+      h("dd", null,
+        data.rework_events,
+        h("span", { class: "muted" }, ` (${pct(data.rework_ratio)})`)),
+      h("dt", null, "window"), h("dd", { class: "muted" }, data.window),
+    ),
+  );
+}
+
+function MarkovRework({ data, topBy, onSelect }) {
+  const backs = (data.edges || []).filter((e) => e.is_back);
+  if (!backs.length) {
+    return h("div", { class: "mk-rework-empty muted" }, "no rework observed");
+  }
+  const keyfn = {
+    probability: (e) => e.probability,
+    count: (e) => e.count,
+    time_weight: (e) => e.time_weight_seconds,
+  }[topBy] || ((e) => e.probability);
+  const rows = backs.slice().sort((a, b) => keyfn(b) - keyfn(a)).slice(0, 10);
+  const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+
+  return h("div", { class: "mk-rework" },
+    h("table", null,
+      h("thead", null, h("tr", null,
+        h("th", null, "from -> to"),
+        h("th", { class: "num" }, "#"),
+        h("th", { class: "num" }, "P"),
+        h("th", { class: "num" }, "P×dwell"),
+      )),
+      h("tbody", null, rows.map((e) =>
+        h("tr", { key: `${e.from}|${e.to}` },
+          h("td", null,
+            h("code", { class: "mk-exec-ref" }, e.from),
+            " -> ",
+            h("code", { class: "mk-exec-ref" }, e.to)),
+          h("td", { class: "num" }, e.count),
+          h("td", { class: "num" }, pct(e.probability)),
+          h("td", { class: "num" }, e.time_weight || "0s"),
+        )
+      )),
+    ),
+  );
+}
+
+// ---- graph rendering -----------------------------------------------------
+//
+// Layering: BFS from all "source" nodes (no observed incoming non-back
+// edge). If none, pick the node with the highest out/in ratio. Put each
+// node at its farthest-from-source rank via forward edges. Back edges
+// draw over the top.
+
+function layerExecutors(edges) {
+  const nodes = new Set();
+  const fwd = new Map();   // from -> [{to, edge}]
+  const rev = new Map();
+  for (const e of edges) {
+    nodes.add(e.from); nodes.add(e.to);
+    if (!e.is_back) {
+      if (!fwd.has(e.from)) fwd.set(e.from, []);
+      fwd.get(e.from).push(e);
+      if (!rev.has(e.to)) rev.set(e.to, []);
+      rev.get(e.to).push(e);
+    }
+  }
+  // Rank = longest forward-path depth from any node with no incoming
+  // forward edges. Handles DAG-ish forward subgraph cleanly.
+  const rank = new Map();
+  for (const n of nodes) rank.set(n, 0);
+  // Kahn-ish relaxation: repeat until stable (bounded by # nodes).
+  let changed = true;
+  let safety = nodes.size + 3;
+  while (changed && safety-- > 0) {
+    changed = false;
+    for (const n of nodes) {
+      const ins = rev.get(n) || [];
+      let best = 0;
+      for (const ie of ins) best = Math.max(best, (rank.get(ie.from) || 0) + 1);
+      if (best > (rank.get(n) || 0)) {
+        rank.set(n, best);
+        changed = true;
+      }
+    }
+  }
+  // Group by rank.
+  const byRank = new Map();
+  for (const [n, r] of rank) {
+    if (!byRank.has(r)) byRank.set(r, []);
+    byRank.get(r).push(n);
+  }
+  // Stable order within a rank.
+  for (const arr of byRank.values()) arr.sort();
+  return { rank, byRank };
+}
+
+function MarkovGraph({ data, timeWeighted, onSelect }) {
+  const edges = data.edges || [];
+  const { rank, byRank } = useMemo(() => layerExecutors(edges), [edges]);
+
+  // Positions: column = rank * colSpacing; row spread inside column.
+  const COL = 240;
+  const ROW = 80;
+  const MARGIN_X = 80;
+  const MARGIN_Y = 60;
+
+  const positions = useMemo(() => {
+    const p = new Map();
+    const ranks = [...byRank.keys()].sort((a, b) => a - b);
+    for (const r of ranks) {
+      const ids = byRank.get(r);
+      ids.forEach((id, i) => {
+        p.set(id, {
+          x: MARGIN_X + r * COL,
+          y: MARGIN_Y + i * ROW,
+        });
+      });
+    }
+    return p;
+  }, [byRank]);
+
+  const maxRank = Math.max(0, ...[...byRank.keys()]);
+  const maxRowCount = Math.max(1, ...[...byRank.values()].map((a) => a.length));
+  const width  = MARGIN_X * 2 + (maxRank + 1) * COL;
+  const height = MARGIN_Y * 2 + maxRowCount * ROW;
+
+  // Edge styling: thickness proportional to `count`, capped.
+  const maxCount = Math.max(1, ...edges.map((e) => e.count));
+  const thick = (c) => 1 + 6 * (c / maxCount);
+
+  // Weight for time-weighted overlay — scale labels/thickness by
+  // probability * mean_dwell when enabled.
+  const maxWeight = Math.max(1e-9, ...edges.map((e) => e.time_weight_seconds || 0));
+  const weightThick = (w) => 1 + 6 * (w / maxWeight);
+
+  const labelFor = (e) => {
+    const pct = `${Math.round((e.probability || 0) * 100)}%`;
+    if (timeWeighted) {
+      return `${pct} · ${e.mean_dwell}`;
+    }
+    return `${pct} (${e.count})`;
+  };
+
+  return h("svg", {
+    class: "mk-svg",
+    viewBox: `0 0 ${width} ${height}`,
+    preserveAspectRatio: "xMidYMid meet",
+  },
+    // arrowheads (two — forward and back — so hues can differ)
+    h("defs", null,
+      h("marker", {
+        id: "mk-arrow-fwd", viewBox: "0 0 10 10", refX: "9", refY: "5",
+        markerWidth: "8", markerHeight: "8", orient: "auto-start-reverse",
+      }, h("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#6ea8ff" })),
+      h("marker", {
+        id: "mk-arrow-back", viewBox: "0 0 10 10", refX: "9", refY: "5",
+        markerWidth: "8", markerHeight: "8", orient: "auto-start-reverse",
+      }, h("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#ff6b6b" })),
+    ),
+
+    // edges first (so nodes cover endpoints cleanly)
+    edges.map((e) => {
+      const a = positions.get(e.from);
+      const b = positions.get(e.to);
+      if (!a || !b) return null;
+      const w = timeWeighted
+        ? weightThick(e.time_weight_seconds || 0)
+        : thick(e.count);
+      const hue = e.is_back ? "#ff6b6b" : "#6ea8ff";
+      const marker = e.is_back ? "url(#mk-arrow-back)" : "url(#mk-arrow-fwd)";
+      // Curve back-edges upward so they read as loop-overs.
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const mx = (a.x + b.x) / 2;
+      const my = (a.y + b.y) / 2;
+      let d;
+      if (e.is_back) {
+        const cx = mx;
+        const cy = my - Math.max(40, Math.abs(dx) * 0.25 + 20);
+        d = `M ${a.x} ${a.y} Q ${cx} ${cy} ${b.x} ${b.y}`;
+      } else if (dy !== 0 && Math.abs(dx) > 20) {
+        const cx1 = a.x + dx * 0.45;
+        const cy1 = a.y;
+        const cx2 = a.x + dx * 0.55;
+        const cy2 = b.y;
+        d = `M ${a.x} ${a.y} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${b.x} ${b.y}`;
+      } else {
+        d = `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+      }
+      const key = `${e.from}|${e.to}`;
+      // Label midpoint (for back-edges, use the curve's apex).
+      const lx = e.is_back ? mx : (a.x + b.x) / 2;
+      const ly = e.is_back
+        ? my - Math.max(40, Math.abs(dx) * 0.25 + 20) + 14
+        : (a.y + b.y) / 2 - 6;
+      return h("g", { key, class: "mk-edge" + (e.is_back ? " back" : "") },
+        h("path", {
+          d, fill: "none", stroke: hue, "stroke-width": w.toFixed(1),
+          "stroke-opacity": "0.75",
+          "marker-end": marker,
+        }),
+        h("text", {
+          x: lx, y: ly, class: "mk-edge-label",
+          "text-anchor": "middle",
+        }, h("title", null,
+            `${e.from} -> ${e.to}\n`
+          + `count: ${e.count}  P: ${Math.round(e.probability*100)}%\n`
+          + `mean dwell: ${e.mean_dwell}  P*dwell: ${e.time_weight}\n`
+          + `source: ${e.classification_source}`
+        ), labelFor(e)),
+      );
+    }),
+
+    // nodes
+    [...positions.entries()].map(([id, p]) => {
+      const isActor = id.startsWith("@");
+      return h("g", {
+        key: id, class: "mk-node" + (isActor ? " actor" : " system"),
+        transform: `translate(${p.x}, ${p.y})`,
+        onClick: () => onSelect && onSelect(id),
+      },
+        h("rect", {
+          x: -70, y: -18, width: 140, height: 36, rx: 6,
+          class: "mk-node-rect",
+        }),
+        h("text", {
+          x: 0, y: 4, "text-anchor": "middle",
+          class: "mk-node-label",
+        }, id),
+      );
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
