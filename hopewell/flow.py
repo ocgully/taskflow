@@ -173,9 +173,24 @@ def enter(project, node_id: str, executor_id: str, *,
     executor, returns False and does NOT emit an event (quiet by
     default — less noise in the event log).
 
+    HW-0034 (reconciliation gate): when `executor_id` is an `agent`
+    component executor and the work item declares `spec-input`
+    references, we run a pre-flight drift check via
+    `reconciliation.check_drift_gate`. If a referenced slice has
+    drifted and there is no resolved `downstream-review` covering it,
+    the gate auto-creates a review node and raises
+    `ReconciliationRequired` — propagated to the caller. Set
+    `HOPEWELL_SKIP_RECONCILIATION=1` to disable.
+
     Returns True on first-time enter, False on no-op.
     """
     _require_executor(project, executor_id)
+    # HW-0034: reconciliation pre-flight. Imported lazily to keep flow.py
+    # standalone-importable (and to avoid a circular import — reconciliation
+    # itself touches `events`/`spec_input`/`model`/`project` modules).
+    from hopewell import reconciliation as recon_mod
+    recon_mod.check_drift_gate(project, node_id, executor_id, actor=actor)
+
     node = project.node(node_id)
     existing = node.location_at(executor_id)
     if existing is not None:

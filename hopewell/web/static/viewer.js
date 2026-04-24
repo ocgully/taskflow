@@ -108,6 +108,47 @@ async function promoteComment(id, title) {
   return r.json();
 }
 
+// ---- Reconciliation (HW-0034) -------------------------------------------
+
+async function fetchReconcileList({ consumer, specPath, status = "open" } = {}) {
+  const params = new URLSearchParams();
+  if (consumer) params.set("consumer", consumer);
+  if (specPath) params.set("spec_path", specPath);
+  if (status) params.set("status", status);
+  const r = await fetch(`/api/reconcile/list?${params.toString()}`);
+  if (!r.ok) throw new Error(`/api/reconcile/list -> ${r.status}`);
+  return r.json();
+}
+
+async function reconcileQueue(body) {
+  const r = await fetch(`/api/reconcile/queue`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`/api/reconcile/queue -> ${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
+async function reconcileResolve(reviewId, body) {
+  const r = await fetch(
+    `/api/reconcile/${encodeURIComponent(reviewId)}/resolve`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`/api/reconcile/resolve -> ${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
 // ---------------------------------------------------------------------------
 // Mermaid (lazy + singleton)
 // ---------------------------------------------------------------------------
@@ -501,6 +542,19 @@ function SpecOverlay({ path, onBack }) {
 
   const consumers = (spec && spec.consumers) || [];
 
+  // HW-0034: count drifted slices across consumers — drives the
+  // "Queue downstream reviews (N)" button.
+  const driftedCount = useMemo(() => {
+    let n = 0;
+    for (const c of consumers) {
+      for (const sl of (c.slices || [])) {
+        const st = sl.state || "unknown";
+        if (st === "drift" || st === "anchor-lost" || st === "missing") n++;
+      }
+    }
+    return n;
+  }, [consumers]);
+
   return h("div", { class: "viewer-spec-overlay" },
     h("div", { class: "viewer-spec-head" },
       h("button", { class: "viewer-back", onClick: onBack }, "← back"),
@@ -514,9 +568,150 @@ function SpecOverlay({ path, onBack }) {
         h("span", { class: "muted" }, ` (${c.slices.length})`),
       )),
     ),
+    // HW-0034: spec-edit-side button + downstream-review summary panel
+    spec && h(ReconcilePanel, { specPath: path, driftedCount }),
     body,
     // HW-0033: comment threads anchored on this spec file
     spec && h(CommentsPanel, { target: path, markdown: spec.text || "" }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation panel (HW-0034)
+// ---------------------------------------------------------------------------
+//
+// Sits between the consumers strip and the spec body. Two sub-features:
+//
+//   1. "Queue downstream reviews (N)" button — fires Trigger A across
+//      every drifted slice consumed off this spec. Disabled when the
+//      drifted-count is zero.
+//   2. A tiny list of OPEN downstream-review nodes for this spec, each
+//      with the four resolution buttons (no-impact, in-scope,
+//      out-of-scope, spec-revert) inline.
+
+function ReconcilePanel({ specPath, driftedCount }) {
+  const [reviews, setReviews] = useState([]);
+  const [pending, setPending] = useState(false);
+  const [err, setErr] = useState(null);
+  const [info, setInfo] = useState(null);
+
+  const load = useCallback(async () => {
+    setErr(null);
+    try {
+      const r = await fetchReconcileList({ specPath, status: "open" });
+      setReviews(r.reviews || []);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }, [specPath]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const queueAll = useCallback(async () => {
+    if (pending) return;
+    setPending(true); setErr(null); setInfo(null);
+    try {
+      const res = await reconcileQueue({ spec_path: specPath });
+      const created = res.created || 0;
+      const skipped = res.skipped_existing || 0;
+      setInfo(
+        `Queued ${created} new review(s)`
+          + (skipped ? `, ${skipped} already open` : "")
+          + ` for ${specPath}.`
+      );
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setPending(false);
+    }
+  }, [pending, specPath, load]);
+
+  const resolve = useCallback(async (review, outcome) => {
+    if (pending) return;
+    let followupTitle = null;
+    let notes = null;
+    if (outcome === "update-out-of-scope") {
+      followupTitle = window.prompt(
+        "Title for the follow-up work item that will block "
+          + (review.consumer_node || "the consumer") + ":",
+        `Follow up on spec change for ${review.consumer_node}`,
+      );
+      if (!followupTitle) return;
+    }
+    notes = window.prompt(`Resolution notes (optional, outcome=${outcome}):`, "")
+      || null;
+    setPending(true); setErr(null); setInfo(null);
+    try {
+      const body = { outcome };
+      if (notes) body.notes = notes;
+      if (followupTitle) body.followup_title = followupTitle;
+      await reconcileResolve(review.review_node, body);
+      setInfo(`Resolved ${review.review_node} (${outcome}).`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setPending(false);
+    }
+  }, [pending, load]);
+
+  const btnLabel = driftedCount > 0
+    ? `Queue downstream reviews (${driftedCount})`
+    : "Queue downstream reviews (0 — clean)";
+
+  return h("div", { class: "reconcile-panel" },
+    h("div", { class: "reconcile-actions" },
+      h("button", {
+        class: "reconcile-queue-btn",
+        disabled: pending || driftedCount === 0,
+        onClick: queueAll,
+        title: driftedCount === 0
+          ? "No drifted slices on this spec — nothing to queue"
+          : `Create downstream-review nodes for the ${driftedCount} drifted slice(s)`,
+      }, pending ? "queuing…" : btnLabel),
+      err && h("span", { class: "reconcile-err" }, err),
+      info && h("span", { class: "reconcile-info muted" }, info),
+    ),
+    reviews.length > 0 && h("div", { class: "reconcile-reviews" },
+      h("div", { class: "reconcile-reviews-head muted" },
+        `${reviews.length} open downstream-review(s):`),
+      reviews.map((r) => {
+        const slice = r.slice || {};
+        const where = slice.anchor
+          ? slice.anchor
+          : (slice.lines ? `L${slice.lines[0]}-L${slice.lines[1]}` : "?");
+        return h("div", { key: r.review_node, class: "reconcile-review-card" },
+          h("div", { class: "reconcile-review-head" },
+            h("span", { class: "node-chip" }, r.review_node),
+            h("span", { class: "muted" },
+              ` blocks ${r.consumer_node} — slice ${where} (${r.trigger})`),
+          ),
+          h("div", { class: "reconcile-resolve-row" },
+            h("button", {
+              class: "reconcile-btn", disabled: pending,
+              onClick: () => resolve(r, "no-impact"),
+              title: "Slice changed but semantics unchanged — re-pin slice_sha",
+            }, "no-impact (re-pin)"),
+            h("button", {
+              class: "reconcile-btn", disabled: pending,
+              onClick: () => resolve(r, "update-in-scope"),
+              title: "Consumer absorbs the new spec into its current scope",
+            }, "in-scope"),
+            h("button", {
+              class: "reconcile-btn", disabled: pending,
+              onClick: () => resolve(r, "update-out-of-scope"),
+              title: "Spawn a follow-up work item that blocks the consumer",
+            }, "out-of-scope (spawn follow-up)"),
+            h("button", {
+              class: "reconcile-btn", disabled: pending,
+              onClick: () => resolve(r, "spec-revert"),
+              title: "Spec change was wrong — record the decision (manual revert)",
+            }, "spec-revert"),
+          ),
+        );
+      }),
+    ),
   );
 }
 

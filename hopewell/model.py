@@ -267,6 +267,39 @@ BUILTIN_COMPONENTS: List[Component] = [
         },
     ),
     Component(
+        name="downstream-review",
+        description=(
+            "Reconciliation node generated when a consumed spec slice "
+            "drifts (HW-0034). Pins the consumer node id, the spec path, "
+            "the specific slice that drifted, and a snapshot of the drift "
+            "(recorded vs current sha + unified diff). Holds a `blocks` "
+            "edge over the consumer until resolved with one of four "
+            "outcomes (no-impact, update-in-scope, update-out-of-scope, "
+            "spec-revert). See `hopewell.reconciliation` + the "
+            "`hopewell reconcile ...` CLI."
+        ),
+        schema={
+            "consumer_node": "string (the work item that referenced the slice)",
+            "spec_path": "string (project-relative spec path)",
+            "slice": (
+                "object {anchor?: string, lines: [start, end]} — same "
+                "selector shape as spec-input slices"
+            ),
+            "drift_snapshot": (
+                "object {recorded_slice_sha, current_slice_sha, patch, state}"
+            ),
+            "trigger": "enum: spec-edit | pickup-gate",
+            "status": "enum: open | resolved",
+            "outcome": (
+                "enum: no-impact | update-in-scope | update-out-of-scope | "
+                "spec-revert | null"
+            ),
+            "resolution_notes": "string (optional)",
+            "followup_node": "string (set when outcome=update-out-of-scope)",
+        },
+        required_fields=["consumer_node", "spec_path"],
+    ),
+    Component(
         name="comment-review",
         description=(
             "Review node promoted from a comment thread (HW-0033). "

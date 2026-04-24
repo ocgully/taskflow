@@ -33,7 +33,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +694,134 @@ def create_app(project_root: Path):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True, **result}
+
+    # ---- Reconciliation endpoints (HW-0034) ----------------------------
+    #
+    # Downstream-review nodes for spec drift. See `hopewell.reconciliation`
+    # for the data model + idempotency rules.
+    #
+    #   POST /api/reconcile/queue           — Trigger A: create reviews
+    #   GET  /api/reconcile/list            — list reviews (filtered)
+    #   POST /api/reconcile/{id}/resolve    — close a review with an outcome
+
+    @app.post("/api/reconcile/queue")
+    async def _reconcile_queue(request: Request) -> Dict[str, Any]:
+        """Trigger A: queue downstream-review nodes for consumers of a slice.
+
+        Body:
+            {
+              "spec_path": "specs/x.md",
+              "heading":   "## Foo",        # optional; either heading OR lines
+              "lines":     [start, end],    # optional
+              "dry_run":   false,           # optional
+              "actor":     "@chris"         # optional; falls back to header
+            }
+        """
+        from hopewell import reconciliation as recon_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        spec_path = body.get("spec_path")
+        if not spec_path:
+            raise HTTPException(status_code=400, detail="`spec_path` required")
+        heading = body.get("heading")
+        lines_raw = body.get("lines")
+        lines: Optional[Tuple[int, int]] = None
+        if lines_raw is not None:
+            try:
+                lines = (int(lines_raw[0]), int(lines_raw[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400,
+                                    detail="`lines` must be [start, end]")
+        if heading and lines:
+            raise HTTPException(status_code=400,
+                                detail="provide `heading` OR `lines`, not both")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            results = recon_mod.queue_reviews(
+                p, spec_path,
+                heading=heading, lines=lines,
+                trigger=recon_mod.TRIGGER_SPEC_EDIT,
+                actor=actor,
+                dry_run=bool(body.get("dry_run", False)),
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "ok": True,
+            "spec_path": spec_path,
+            "count": len(results),
+            "created": sum(1 for r in results if r["action"] == "created"),
+            "skipped_existing": sum(1 for r in results if r["action"] == "skipped-existing"),
+            "skipped_clean": sum(1 for r in results if r["action"] == "skipped-clean"),
+            "dry_run_count": sum(1 for r in results if r["action"] == "dry-run"),
+            "results": results,
+        }
+
+    @app.get("/api/reconcile/list")
+    def _reconcile_list(consumer: Optional[str] = None,
+                        spec_path: Optional[str] = None,
+                        status: str = "open") -> Dict[str, Any]:
+        from hopewell import reconciliation as recon_mod
+        p = _load_project(project_root)
+        try:
+            rows = recon_mod.list_reviews(
+                p,
+                consumer=consumer,
+                spec_path=spec_path,
+                status=status,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "count": len(rows),
+            "filter": {"consumer": consumer, "spec_path": spec_path,
+                       "status": status},
+            "reviews": rows,
+        }
+
+    @app.post("/api/reconcile/{review_id}/resolve")
+    async def _reconcile_resolve(review_id: str, request: Request) -> Dict[str, Any]:
+        """Close a review with one of the four outcomes.
+
+        Body:
+            {
+              "outcome": "no-impact" | "update-in-scope"
+                       | "update-out-of-scope" | "spec-revert",
+              "notes":           "...",        # optional
+              "followup_title":  "...",        # required when outcome=update-out-of-scope
+              "actor":           "@chris"      # optional
+            }
+        """
+        from hopewell import reconciliation as recon_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        outcome = body.get("outcome")
+        if not outcome:
+            raise HTTPException(status_code=400, detail="`outcome` required")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            result = recon_mod.resolve_review(
+                p, review_id,
+                outcome=outcome,
+                notes=body.get("notes"),
+                followup_title=body.get("followup_title"),
+                actor=actor,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "result": result}
 
     @app.get("/api/history")
     def _history(limit: int = 50, cursor: int = 0) -> Dict[str, Any]:

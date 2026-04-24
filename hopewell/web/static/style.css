@@ -1321,3 +1321,53 @@ footer.bottom {
   pointer-events: auto; cursor: help;
 }
 .mk-edge.back .mk-edge-label { fill: var(--err); }
+
+/* HW-0034 — Reconciliation panel (downstream-review) */
+.reconcile-panel {
+  margin: 12px 0;
+  padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.reconcile-actions {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+.reconcile-queue-btn {
+  padding: 6px 12px;
+  background: var(--bg-3);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.reconcile-queue-btn:hover { background: var(--accent); color: #fff; }
+.reconcile-queue-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+.reconcile-err { color: var(--err); font-size: 12px; }
+.reconcile-info { font-size: 12px; }
+.reconcile-reviews {
+  margin-top: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.reconcile-reviews-head { font-size: 11px; text-transform: uppercase; }
+.reconcile-review-card {
+  padding: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+}
+.reconcile-review-head { display: flex; gap: 6px; align-items: baseline; }
+.reconcile-resolve-row {
+  margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;
+}
+.reconcile-btn {
+  padding: 3px 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.reconcile-btn:hover { border-color: var(--accent); }
+.reconcile-btn[disabled] { opacity: 0.5; cursor: wait; }

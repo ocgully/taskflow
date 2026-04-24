@@ -9,6 +9,9 @@ int exit code, matching the rest of `cli.py`.
 Exit codes:
     0 — success
     1 — unknown executor / unknown node / malformed input
+    2 — `flow enter` blocked by reconciliation gate (HW-0034). Caller
+        should resolve the referenced downstream-review node before
+        retrying. See `hopewell reconcile resolve --help`.
 
 Suggested subparser wiring (drop into `_build_parser` in `cli.py`):
 
@@ -97,6 +100,7 @@ def _format(args) -> str:
 
 
 def cmd_flow_enter(args) -> int:
+    from hopewell import reconciliation as recon_mod
     try:
         project = _project(args)
         added = flow_mod.enter(
@@ -105,6 +109,32 @@ def cmd_flow_enter(args) -> int:
             reason=getattr(args, "reason", None),
             actor=_actor_from_env(),
         )
+    except recon_mod.ReconciliationRequired as e:
+        # HW-0034: gate fired — flow.enter is blocked until the named
+        # review node resolves. Exit 2 so scripts can distinguish "blocked"
+        # from "bad input" (1) and "ok" (0).
+        if _format(args) == "json":
+            _print_json({
+                "op": "flow.enter",
+                "blocked": True,
+                "review_node": e.review_node_id,
+                "drifted_slices": e.drifted_slices,
+                "node": args.node_id,
+                "executor": args.executor,
+            })
+        else:
+            print(f"hopewell: {e}", file=sys.stderr)
+            print(
+                f"  resolve via:  hopewell reconcile resolve {e.review_node_id} "
+                f"--outcome <no-impact|update-in-scope|update-out-of-scope|spec-revert>",
+                file=sys.stderr,
+            )
+            print(
+                f"  bypass (scripts only):  HOPEWELL_SKIP_RECONCILIATION=1 "
+                f"hopewell flow enter {args.node_id} --executor {args.executor}",
+                file=sys.stderr,
+            )
+        return 2
     except (ValueError, FileNotFoundError) as e:
         print(f"hopewell: {e}", file=sys.stderr)
         return 1
