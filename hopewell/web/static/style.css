@@ -191,7 +191,7 @@ footer.bottom {
 .bl-line .badge.uat.uat-waived  { color: var(--fg-muted); }
 .bl-line .badge.crit { color: var(--warn); border-color: rgba(245, 181, 86, 0.55); }
 
-/* ---- Canvas (HW-0029: flow-network map with packet overlay) ---- */
+/* ---- Canvas (HW-0042: flow-network on React Flow / XYFlow v12) ---- */
 
 .fx-canvas {
   position: relative;
@@ -203,14 +203,97 @@ footer.bottom {
   outline: none;
 }
 
-.fx-canvas .fx-stage {
-  width: 100%;
-  height: 100%;
-  display: block;
-  cursor: grab;
-  user-select: none;
+/* React Flow theming — dark pane to match --bg-*. */
+.fx-canvas .react-flow {
+  background: var(--bg-2);
+  color: var(--fg);
 }
-.fx-canvas .fx-stage:active { cursor: grabbing; }
+.fx-canvas .react-flow__attribution { display: none; }
+.fx-canvas .react-flow__controls {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.fx-canvas .react-flow__controls-button {
+  background: var(--bg-3);
+  color: var(--fg);
+  border-bottom: 1px solid var(--border);
+  fill: var(--fg);
+}
+.fx-canvas .react-flow__controls-button:hover { background: var(--bg-2); }
+.fx-canvas .react-flow__minimap { border-radius: var(--radius); border: 1px solid var(--border); }
+
+/* Custom-node shells.
+ * React Flow sizes the host div; we render shape visuals inside. The
+ * host div itself is transparent — shape SVG fills it — except for
+ * `agent`, where the host IS the rounded rect (cheaper DOM). */
+.fx-rf-node {
+  font-size: 12px;
+  outline: none;
+}
+.fx-rf-node.fx-selected   { filter: drop-shadow(0 0 3px var(--accent)); }
+.fx-rf-node.fx-highlighted { filter: drop-shadow(0 0 4px var(--warn)); }
+.fx-rf-label {
+  flex: 1;
+  font-weight: 500;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 4px;
+  pointer-events: none;
+}
+.fx-rf-avatar {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  background: #0b0d10;
+  border: 1.2px solid var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 10px;
+  flex: 0 0 26px;
+}
+.fx-rf-badge {
+  position: absolute;
+  top: -8px; right: -8px;
+  background: #14161a;
+  border: 1.4px solid var(--warn);
+  color: var(--warn);
+  border-radius: 50%;
+  min-width: 22px; height: 22px;
+  padding: 0 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600;
+  font-family: ui-sans-serif, sans-serif;
+  z-index: 2;
+}
+
+/* Hide default React Flow node borders/background — we draw our own. */
+.fx-canvas .react-flow__node {
+  background: transparent;
+  border: none;
+  padding: 0;
+  box-shadow: none;
+}
+.fx-canvas .react-flow__node.selected { box-shadow: none; }
+
+/* React Flow edges: style.css owns the palette; canvas.js sets the
+ * inline `stroke` to resolve the correct colour at paint time. */
+.fx-canvas .react-flow__edge-path { stroke-linecap: round; }
+.fx-canvas .react-flow__edge.fx-edge-forbidden .react-flow__edge-path {
+  stroke: #ff6b6b !important;
+  stroke-width: 1.8 !important;
+  stroke-dasharray: 6 4 !important;
+}
+.fx-canvas .react-flow__edge .react-flow__edge-text {
+  fill: var(--fg);
+  font-size: 10px;
+  font-family: ui-monospace, monospace;
+}
+.fx-canvas .react-flow__edge .react-flow__edge-textbg { fill: var(--bg-3); }
+.fx-canvas .react-flow__handle { pointer-events: none; }
 
 /* Toolbar ------------------------------------------------------------- */
 .fx-toolbar {
@@ -254,77 +337,8 @@ footer.bottom {
   font-size: 13px !important;
 }
 
-/* Nodes --------------------------------------------------------------- */
-.fx-node { cursor: pointer; outline: none; }
-.fx-node:focus .fx-node-shape,
-.fx-node.fx-selected .fx-node-shape { filter: drop-shadow(0 0 3px var(--accent)); }
-
-.fx-node-shape {
-  transition: fill 0.4s ease, stroke 0.2s ease;
-}
-
-.fx-node-label {
-  fill: var(--fg);
-  font-size: 12px;
-  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
-  pointer-events: none;
-  font-weight: 500;
-}
-
-.fx-avatar-text {
-  font-size: 10px;
-  font-family: ui-monospace, monospace;
-  font-weight: 700;
-  pointer-events: none;
-}
-
-.fx-depth-badge text {
-  pointer-events: none;
-  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
-}
-
-/* Edges --------------------------------------------------------------- */
-.fx-edge {
-  stroke: #6a7384;
-  stroke-width: 1.4;
-  fill: none;
-  transition: stroke 0.2s ease, stroke-width 0.2s ease;
-}
-.fx-edge.fx-edge-required { stroke: #c4cbd6; stroke-width: 2.2; }
-.fx-edge.fx-edge-optional { stroke: #6a7384; stroke-width: 1.4; }
-.fx-edge.fx-edge-conditional { stroke: #8a93a2; stroke-width: 1.4; }
-.fx-edge.fx-edge-forbidden {
-  stroke: #ff6b6b;
-  stroke-width: 1.8;
-  stroke-dasharray: 6 4;
-}
-.fx-edge.fx-edge-highlighted {
-  stroke: #f5b556 !important;
-  stroke-width: 3 !important;
-}
-.fx-edge-hit { cursor: pointer; }
-
-.fx-edge-forbidden-mark {
-  fill: #ff6b6b;
-  font-size: 18px;
-  font-weight: 700;
-  pointer-events: none;
-  font-family: ui-sans-serif, sans-serif;
-}
-
-.fx-edge-label text {
-  fill: var(--fg);
-  font-size: 10px;
-  font-family: ui-monospace, monospace;
-  pointer-events: none;
-}
-.fx-edge-pill {
-  fill: var(--bg-3);
-  stroke: var(--border);
-  stroke-width: 1;
-}
-
-/* Packets (animated dots) -------------------------------------------- */
+/* Packets (animated dots, overlaid on React Flow viewport) ---------- */
+.fx-packet-layer { overflow: visible; }
 .fx-packet circle {
   pointer-events: none;
   filter: drop-shadow(0 0 3px currentColor);
@@ -336,19 +350,8 @@ footer.bottom {
   opacity: 0.85;
 }
 
-/* Minimap ------------------------------------------------------------- */
-.fx-minimap-wrap {
-  position: absolute;
-  right: 10px; bottom: 10px;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 4px;
-  z-index: 3;
-  cursor: crosshair;
-}
-.fx-minimap { display: block; }
-.fx-minimap-viewport { pointer-events: none; }
+/* Edge modifier classes (React Flow stroke colours come from canvas.js
+ * style prop; forbidden is special because it overrides stroke + dash). */
 
 /* Legend -------------------------------------------------------------- */
 .fx-legend {
