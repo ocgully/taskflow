@@ -25,6 +25,7 @@ from hopewell import merge_driver as merge_driver_mod
 from hopewell import network_cli as network_cli_mod
 from hopewell import paths as paths_mod
 from hopewell import reconciliation_cli as recon_cli_mod
+from hopewell import release_cli as release_cli_mod
 from hopewell import resume as resume_mod
 from hopewell import spec_input_cli as spec_cli_mod
 from hopewell import uat as uat_mod
@@ -1263,6 +1264,67 @@ def _build_parser() -> argparse.ArgumentParser:
     rp_r.add_argument("--followup-title", dest="followup_title", default=None)
     rp_r.add_argument("--format", choices=["text", "json"], default="text")
     rp_r.set_defaults(func=lambda a: recon_cli_mod.cmd_reconcile_resolve(a))
+
+    # release — release tooling: confidence scoring + kickback + gh release (HW-0043)
+    sp = sub.add_parser("release",
+        help="Release tooling: release nodes + confidence scoring + kickback flow")
+    lsub = sp.add_subparsers(dest="release_cmd", required=True)
+
+    lp = lsub.add_parser("start", help="Initialize a release node")
+    lp.add_argument("version")
+    lp.add_argument("--scope", default=None, help="Comma-separated node ids")
+    lp.add_argument("--from-window", dest="from_window", default=None)
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_start(a))
+
+    lp = lsub.add_parser("scope", help="Add/remove nodes from release scope")
+    lp.add_argument("version")
+    g = lp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--add", dest="add_id", default=None)
+    g.add_argument("--rm", dest="rm_id", default=None)
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_scope(a))
+
+    lp = lsub.add_parser("report", help="Emit / refresh release report")
+    lp.add_argument("version")
+    lp.add_argument("--path", default=None)
+    lp.add_argument("--regenerate", action="store_true")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_report(a))
+
+    lp = lsub.add_parser("score", help="Compute + print current confidence score")
+    lp.add_argument("version")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_score(a))
+
+    lp = lsub.add_parser("finalize",
+        help="Final gate: release if score >= threshold, else hold")
+    lp.add_argument("version")
+    lp.add_argument("--dry-run", action="store_true")
+    lp.add_argument("--tag", action="store_true")
+    lp.add_argument("--gh-release", dest="gh_release", action="store_true")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_finalize(a))
+
+    lp = lsub.add_parser("kickback",
+        help="Create needs-rework node blocking the release")
+    lp.add_argument("version")
+    lp.add_argument("--root-cause", dest="root_cause", required=True)
+    lp.add_argument("--affected", required=True)
+    lp.add_argument("--route-to", dest="route_to", default="@orchestrator")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_kickback(a))
+
+    lp = lsub.add_parser("show", help="Show a release node")
+    lp.add_argument("version")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_show(a))
+
+    lp = lsub.add_parser("list", help="List releases")
+    lp.add_argument("--status",
+        choices=["draft", "held", "released", "kicked-back", "all"], default="all")
+    lp.add_argument("--format", choices=["text", "json"], default="text")
+    lp.set_defaults(func=lambda a: release_cli_mod.cmd_release_list(a))
 
     # claude-hooks — dispatcher for Claude Code hook events (HW-0040)
     ch = sub.add_parser("claude-hooks",
