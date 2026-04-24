@@ -1440,7 +1440,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--format", choices=["text", "json"], default="text")
     sp.set_defaults(func=cmd_claim)
 
-    sp = sub.add_parser("release", help="Release a claim — delete hopewell/<id>[-*] branches")
+    sp = sub.add_parser("release-claim",
+        aliases=["unclaim"],
+        help="Release a claim — delete hopewell/<id>[-*] branches (was: release)")
     sp.add_argument("id")
     sp.add_argument("--keep-remote", action="store_true",
                     help="Delete the local branch only; keep the remote branch in place")
