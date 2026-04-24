@@ -7,8 +7,8 @@
 import { h, render, Fragment } from "https://esm.sh/preact@10.22.0";
 import { useState, useEffect, useMemo, useRef, useCallback }
   from "https://esm.sh/preact@10.22.0/hooks";
-import * as d3 from "https://esm.sh/d3@7.9.0";
 import { marked } from "https://esm.sh/marked@12.0.2";
+import { CanvasView } from "/static/canvas.js";
 
 // Markdown renderer config: GFM on, line breaks on, no raw HTML passthrough.
 // marked escapes HTML by default when `mangle`/`headerIds` aren't configured;
@@ -88,8 +88,9 @@ function dominantComponent(n) {
 
 function App() {
   const [state, setState] = useState(EMPTY_STATE);
-  const [tab, setTab] = useState("backlog");
+  const [tab, setTab] = useState("canvas");     // HW-0029: canvas is the prominent default.
   const [detailId, setDetailId] = useState(null);
+  const [journeyId, setJourneyId] = useState(null);   // HW-0029: item-journey overlay
   const [sseOk, setSseOk] = useState(false);
   const [lastEvent, setLastEvent] = useState("no events yet");
   const [error, setError] = useState(null);
@@ -157,12 +158,25 @@ function App() {
     };
   }, [reload]);
 
-  const onSelect = useCallback((id) => setDetailId(id), []);
+  // onSelect routes clicks from any view:
+  //   * Always open the detail panel for the node.
+  //   * Additionally arm a journey-overlay so the Canvas tab highlights
+  //     the work item's path through the flow network (HW-0029 criterion
+  //     "clicking a work item anywhere in the UI highlights its path on
+  //     the canvas as a colored trail").
+  const onSelect = useCallback((id) => {
+    setDetailId(id);
+    setJourneyId(id);
+  }, []);
 
   return h(Fragment, null,
     error && h("div", { class: "empty" }, `Error loading state: ${error}`),
     tab === "backlog"  && h(BacklogView,  { state, onSelect }),
-    tab === "canvas"   && h(CanvasView,   { state, onSelect }),
+    tab === "canvas"   && h(CanvasView,   {
+      onSelect,
+      journeyId,
+      journeyBus: setJourneyId,
+    }),
     tab === "timeline" && h(TimelineView, { state, onSelect }),
     tab === "uat"      && h(UatView,      { state, onSelect, reload }),
     tab === "history"  && h(HistoryView,  { onSelect }),
@@ -331,117 +345,11 @@ function BacklogView({ state, onSelect }) {
 }
 
 // ---------------------------------------------------------------------------
-// Canvas view — D3 force graph
+// Canvas view — see canvas.js (HW-0029).
+// The HW-0023 D3-force canvas was removed: it rendered work items as
+// nodes, which misframed the domain. The flow network is now the map
+// (executors + routes), and work items are packets flowing through it.
 // ---------------------------------------------------------------------------
-
-function CanvasView({ state, onSelect }) {
-  const svgRef = useRef(null);
-  const simRef = useRef(null);
-
-  useEffect(() => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return;
-    const rect = svgEl.getBoundingClientRect();
-    const width = rect.width || 800;
-    const height = rect.height || 600;
-
-    const nodes = state.nodes.map((n) => ({
-      id: n.id,
-      title: n.title,
-      status: n.status,
-      dominant: dominantComponent(n),
-      components: n.components || [],
-    }));
-    const nodeIds = new Set(nodes.map((n) => n.id));
-    const links = state.edges
-      .filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to))
-      .map((e) => ({ source: e.from, target: e.to, kind: e.kind }));
-
-    const svg = d3.select(svgEl);
-    svg.selectAll("*").remove();
-
-    const g = svg.append("g");
-
-    // Zoom.
-    svg.call(d3.zoom()
-      .scaleExtent([0.25, 4])
-      .on("zoom", (ev) => g.attr("transform", ev.transform)));
-
-    const link = g.append("g")
-      .selectAll("line")
-      .data(links)
-      .join("line")
-      .attr("class", (d) => `edge ${d.kind}`);
-
-    const node = g.append("g")
-      .selectAll("g")
-      .data(nodes)
-      .join("g")
-      .attr("class", "node")
-      .call(d3.drag()
-        .on("start", (ev, d) => {
-          if (!ev.active) simRef.current.alphaTarget(0.3).restart();
-          d.fx = d.x; d.fy = d.y;
-        })
-        .on("drag", (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
-        .on("end", (ev, d) => {
-          if (!ev.active) simRef.current.alphaTarget(0);
-          d.fx = null; d.fy = null;
-        }));
-
-    node.append("circle")
-      .attr("r", 9)
-      .attr("fill", (d) => colourFor(d.dominant))
-      .attr("opacity", (d) => ["done", "archived", "cancelled"].includes(d.status) ? 0.45 : 0.95)
-      .on("click", (_, d) => onSelect(d.id));
-
-    node.append("text")
-      .attr("x", 12)
-      .attr("y", 4)
-      .text((d) => d.id);
-
-    node.append("title")
-      .text((d) => `${d.id}  ${d.title}\nstatus: ${d.status}\ncomponents: ${d.components.join(", ")}`);
-
-    const sim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).id((d) => d.id).distance(65).strength(0.4))
-      .force("charge", d3.forceManyBody().strength(-180))
-      .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collide", d3.forceCollide(14))
-      .on("tick", () => {
-        link
-          .attr("x1", (d) => d.source.x).attr("y1", (d) => d.source.y)
-          .attr("x2", (d) => d.target.x).attr("y2", (d) => d.target.y);
-        node.attr("transform", (d) => `translate(${d.x},${d.y})`);
-      });
-    simRef.current = sim;
-
-    return () => sim.stop();
-  }, [state.nodes, state.edges, onSelect]);
-
-  // Legend: dominant-components present.
-  const legendComponents = useMemo(() => {
-    const set = new Set(state.nodes.map(dominantComponent));
-    return Array.from(set).sort();
-  }, [state.nodes]);
-
-  if (state.nodes.length === 0) {
-    return h("div", { class: "empty" }, "No nodes to plot.");
-  }
-
-  return h("div", { class: "canvas-wrap" },
-    h("svg", { ref: svgRef }),
-    h("div", { class: "legend" },
-      h("div", { style: "font-weight:600; margin-bottom:4px" }, "Dominant component"),
-      legendComponents.map((c) => h("div", { key: c },
-        h("span", { class: "sw", style: `background:${colourFor(c)}` }),
-        c,
-      )),
-      h("div", { style: "margin-top:6px; color: var(--fg-muted); font-size:10px" },
-        "Edges: blocks=red, parent=dashed, consumes=blue, related=violet"),
-    ),
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Timeline view — wave schedule
