@@ -352,10 +352,50 @@ const NODE_TYPES = {
 
 async function computeLayout(executors, routes) {
   const ids = new Set(executors.map((e) => e.id));
+
+  // --- Back-edge detection via DFS --------------------------------------
+  // An edge is a "back edge" iff it targets a node currently on the DFS
+  // stack (an ancestor). Back edges close cycles; removing them yields a
+  // DAG that ELK can layer cleanly. We also use this classification to
+  // render forward edges white and back edges grey + dashed.
+  const adj = new Map();
+  for (const ex of executors) adj.set(ex.id, []);
+  const edgeIndex = new Map();   // `${from}|${to}` -> route index
+  routes.forEach((r, i) => {
+    if (!ids.has(r.from) || !ids.has(r.to)) return;
+    adj.get(r.from).push(r.to);
+    if (!edgeIndex.has(`${r.from}|${r.to}`)) edgeIndex.set(`${r.from}|${r.to}`, i);
+  });
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = new Map();
+  for (const ex of executors) color.set(ex.id, WHITE);
+  const backEdges = new Set();   // `${from}|${to}`
+
+  const dfs = (u) => {
+    color.set(u, GRAY);
+    for (const v of adj.get(u) || []) {
+      const c = color.get(v);
+      if (c === WHITE) dfs(v);
+      else if (c === GRAY) backEdges.add(`${u}|${v}`);
+      // BLACK: forward/cross edge — not a back edge.
+    }
+    color.set(u, BLACK);
+  };
+
+  // Source-only nodes first so DFS roots sit at the flow origin.
+  const sourceSeeds = executors.filter((e) =>
+    !routes.some((r) => r.to === e.id && ids.has(r.from)));
+  for (const s of sourceSeeds) if (color.get(s.id) === WHITE) dfs(s.id);
+  for (const ex of executors) if (color.get(ex.id) === WHITE) dfs(ex.id);
+
+  // Recompute in/out counts over the FORWARD DAG only (ignore back edges),
+  // so `LAST_SEPARATE` actually catches the real sinks (archived, prod-deploy)
+  // even when cross-cutters back-link to them.
   const incoming = new Map();
   const outgoing = new Map();
   for (const r of routes) {
     if (!ids.has(r.from) || !ids.has(r.to)) continue;
+    if (backEdges.has(`${r.from}|${r.to}`)) continue;
     incoming.set(r.to, (incoming.get(r.to) || 0) + 1);
     outgoing.set(r.from, (outgoing.get(r.from) || 0) + 1);
   }
@@ -386,6 +426,7 @@ async function computeLayout(executors, routes) {
     }),
     edges: routes
       .filter((r) => ids.has(r.from) && ids.has(r.to))
+      .filter((r) => !backEdges.has(`${r.from}|${r.to}`))
       .map((r, i) => ({
         id: `e${i}-${r.from}-${r.to}`,
         sources: [r.from],
@@ -416,7 +457,7 @@ async function computeLayout(executors, routes) {
     };
   }
   const totalHeight = (res.height || 600) + (res.width || 800) * DIAGONAL_SLOPE;
-  return { positions, width: res.width || 800, height: totalHeight };
+  return { positions, width: res.width || 800, height: totalHeight, backEdges };
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +551,15 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
   }, [network, layout, packets, activityByExec, journeyNodes]);
 
   // Build React Flow edges from routes.
+  //
+  // Edge colour semantics (HW-0042 follow-up):
+  //   forward  -> white    (solid; required thicker than optional)
+  //   backward -> grey     (dashed; represents feedback / rework / cycle-closers)
+  //   forbidden-> red      (dashed; DMZ violation — reserved)
+  //   highlighted (journey overlay) -> amber, always on top
   const rfEdges = useMemo(() => {
-    if (!network) return [];
+    if (!network || !layout) return [];
+    const backEdges = layout.backEdges || new Set();
     return network.routes.map((r, i) => {
       const route = r || {};
       const required = !!route.required;
@@ -519,13 +567,32 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
       const cond = route.condition;
       const key = `${route.from}|${route.to}`;
       const hl = journeyEdges.has(key);
-      // Class list on the inner SVG path so style.css can colour us.
+      const isBack = backEdges.has(key);
+
       let cls = "fx-rf-edge";
-      if (required) cls += " fx-edge-required";
+      if (isBack) cls += " fx-edge-back";
+      else if (required) cls += " fx-edge-required";
       else if (cond) cls += " fx-edge-conditional";
       else cls += " fx-edge-optional";
       if (forbidden) cls += " fx-edge-forbidden";
       if (hl) cls += " fx-edge-highlighted";
+
+      // Color resolution (highlight > forbidden > back > required > optional).
+      const stroke =
+        hl ? "#f5b556" :
+        forbidden ? "#ff6b6b" :
+        isBack ? "#8a93a2" :
+        "#ffffff";
+      const strokeWidth =
+        hl ? 3 :
+        isBack ? 1.4 :
+        required ? 2.2 :
+        1.6;
+      const strokeDasharray =
+        forbidden ? "6 4" :
+        isBack ? "6 5" :
+        undefined;
+
       return {
         id: `e${i}-${route.from}-${route.to}`,
         source: route.from,
@@ -538,19 +605,15 @@ function InnerCanvas({ onSelect, journeyId, journeyBus,
         labelStyle:   cond ? { fill: "var(--fg)", fontFamily: "ui-monospace, monospace", fontSize: 10 } : undefined,
         markerEnd: forbidden ? undefined : {
           type: "arrowclosed",
-          color: hl ? "#f5b556" : (required ? "#c4cbd6" : "#6a7384"),
+          color: stroke,
           width: hl ? 16 : 14,
           height: hl ? 16 : 14,
         },
-        style: {
-          stroke: hl ? "#f5b556" : (forbidden ? "#ff6b6b" : (required ? "#c4cbd6" : "#6a7384")),
-          strokeWidth: hl ? 3 : (required ? 2.2 : 1.4),
-          strokeDasharray: forbidden ? "6 4" : undefined,
-        },
-        data: { route, key },
+        style: { stroke, strokeWidth, strokeDasharray },
+        data: { route, key, isBack },
       };
     });
-  }, [network, journeyEdges]);
+  }, [network, layout, journeyEdges]);
 
   // RAF pulse while any packet is in flight, so we re-render position
   // frames. React Flow edges are the stable substrate; the packets are
