@@ -1,0 +1,731 @@
+"""Project — the central class. Loads config, reads/writes nodes, appends events."""
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set
+
+from taskflow import attestation as att_mod
+from taskflow import config as config_mod
+from taskflow import events, meta as meta_mod, paths, storage
+from taskflow.attestation import AgentRegistry
+from taskflow.config import ProjectConfig
+from taskflow.model import (
+    ComponentRegistry, Edge, EdgeKind, Node, NodeInput, NodeOutput,
+    NodeStatus, STATUS_TRANSITIONS, default_registry, format_node_id,
+    parse_node_id,
+)
+
+
+CLAUDEIGNORE_SNIPPET = "/.hopewell/\n"
+
+CLAUDEMD_BLOCK = """\
+## Hopewell — do not read `.hopewell/` directly
+
+`.hopewell/` holds the work graph (tickets, edges, events, attestations).
+Agents must NOT read files in that directory during research. Use the
+`taskflow query <...>` CLI (or the `hopewell` Python library) for any
+lookup. Tree-browsing `.hopewell/` defeats the point of the tool (tokens
++ non-determinism). Violations surface in reviews as "you read
+.hopewell/ — please re-do via the CLI."
+"""
+
+
+class Project:
+    """A loaded Hopewell project rooted at a directory containing `.hopewell/`."""
+
+    def __init__(self, root: Path, cfg: ProjectConfig, registry: ComponentRegistry) -> None:
+        self.root = root.resolve()
+        self.cfg = cfg
+        self.registry = registry
+        self._agent_registry: Optional[AgentRegistry] = None
+        # Populated by `load_project_extensions` during `Project.load`.
+        self.extension_errors: List[Dict[str, Any]] = []
+        self.extension_summary: Dict[str, Any] = {}
+
+    # ---- load / init ----
+
+    @classmethod
+    def load(cls, start: Optional[Path] = None) -> "Project":
+        root = paths.require_project_root(start)
+        cfg = config_mod.load(paths.hw_dir(root) / "config.toml")
+        reg = default_registry()
+        # Filter registry to enabled components (keeps validation useful without
+        # rejecting built-ins a project chose not to enable).
+
+        # Cross-version compatibility gate.
+        #   - If meta.json is present, check_compatibility raises on mismatch.
+        #   - If meta.json is missing (deleted by hand, filesystem glitch),
+        #     auto-heal by writing a current-version stamp. Defense-in-depth.
+        #   - minimum_version from config is enforced regardless.
+        hw = paths.hw_dir(root)
+        mf = meta_mod.load(hw)
+        if mf is None and hw.is_dir():
+            mf = meta_mod.write_for_init(hw)
+        meta_mod.check_compatibility(mf, minimum_version=cfg.coordination.minimum_version)
+
+        project = cls(root, cfg, reg)
+
+        # Project-level extensions: .hopewell/processors/*.py + .hopewell/components/*.yaml.
+        # Import lazily to avoid a circular import (extensions -> orchestrator -> project).
+        try:
+            from taskflow.extensions import load_project_extensions
+            summary = load_project_extensions(project)
+            project.extension_summary = summary
+            project.extension_errors = list(summary.get("errors", []))
+            if project.extension_errors:
+                events.append(
+                    project.events_path, "project.extensions.errors",
+                    data={"count": len(project.extension_errors),
+                          "errors": project.extension_errors[:10]},
+                )
+        except Exception as e:  # noqa: BLE001 — never let extensions break load
+            project.extension_errors = [{
+                "file": "<loader>",
+                "kind": "loader",
+                "error": f"{type(e).__name__}: {e}",
+            }]
+
+        return project
+
+    @classmethod
+    def init(cls, root: Path, *, id_prefix: str = "TF", name: Optional[str] = None,
+             overwrite_claudemd: bool = False,
+             auto_backfill: bool = True) -> "Project":
+        root = root.resolve()
+        paths.ensure_hw_dir(root)
+        hw = paths.hw_dir(root)
+
+        # Config
+        cfg = ProjectConfig.default(name or root.name)
+        cfg.id_prefix = id_prefix
+        config_path = hw / "config.toml"
+        if not config_path.is_file():
+            config_mod.write(config_path, cfg)
+        else:
+            cfg = config_mod.load(config_path)
+
+        # .claudeignore hint INSIDE .hopewell/ (visible; documented)
+        claudeignore = hw / ".claudeignore"
+        if not claudeignore.is_file():
+            claudeignore.write_text(CLAUDEIGNORE_SNIPPET, encoding="utf-8")
+
+        # And at the project root so it actually takes effect for Claude Code.
+        root_claudeignore = root / ".claudeignore"
+        existing = root_claudeignore.read_text(encoding="utf-8") if root_claudeignore.is_file() else ""
+        if "/.hopewell/" not in existing:
+            new = existing.rstrip() + ("\n" if existing else "") + CLAUDEIGNORE_SNIPPET
+            root_claudeignore.write_text(new, encoding="utf-8")
+
+        # CLAUDE.md block.
+        claudemd = root / "CLAUDE.md"
+        if claudemd.is_file():
+            md_text = claudemd.read_text(encoding="utf-8")
+            if "## Hopewell — do not read `.hopewell/` directly" not in md_text:
+                suffix = md_text.rstrip() + "\n\n" + CLAUDEMD_BLOCK
+                claudemd.write_text(suffix, encoding="utf-8")
+        # If no CLAUDE.md exists, do NOT create one — respect whatever the
+        # project prefers. The rule is still in .claudeignore.
+
+        # Event log — first entry only on a truly new project. Re-running
+        # `taskflow init` on an existing .hopewell/ is idempotent: skip the
+        # duplicate project.init event but still refresh claudeignore /
+        # CLAUDE.md rule / merge driver so upgrades flow in.
+        events_path = hw / "events.jsonl"
+        already_initialized = _has_project_init_event(events_path)
+        if not already_initialized:
+            events.append(events_path, "project.init",
+                          data={"name": cfg.name, "id_prefix": cfg.id_prefix})
+
+        # Empty edges log (so readers never have to worry about missing file).
+        edges_log = hw / "edges.jsonl"
+        if not edges_log.is_file():
+            edges_log.write_text("", encoding="utf-8")
+
+        # Git merge driver + .gitattributes for JSONL append-only logs (v0.5).
+        # Best-effort: only activates in a git worktree. Idempotent.
+        _install_merge_driver(root)
+
+        # Write or refresh meta.json — the version contract (v0.5.2).
+        if already_initialized:
+            meta_mod.write_for_migrate(hw)
+        else:
+            meta_mod.write_for_init(hw)
+
+        project = cls.load(root)
+
+        # HW-0049: auto-backfill on fresh init when sources are discoverable.
+        # Entirely delegated to backfill.maybe_backfill_on_init so init() stays
+        # readable and the policy lives in one place. Import is lazy to avoid
+        # load-time cycles.
+        if auto_backfill and not already_initialized:
+            try:
+                from taskflow import backfill as _backfill_mod
+                _backfill_mod.maybe_backfill_on_init(project, enabled=True)
+            except Exception as exc:  # noqa: BLE001 — never block init on backfill
+                events.append(project.events_path, "project.backfill.error",
+                              data={"error": f"{type(exc).__name__}: {exc}"})
+
+        return project
+
+    @classmethod
+    def migrate(cls, start: Optional[Path] = None) -> "Project":
+        """Re-apply every idempotent setup step to an existing `.hopewell/`.
+
+        Used when a new Hopewell version adds project-level setup (new
+        .gitattributes entries, new config sections, new CLAUDE.md rules).
+        Safe to re-run any number of times.
+        """
+        root = paths.require_project_root(start)
+        project = cls.load(root)
+
+        # Re-run everything in init that is idempotent; skip the duplicate
+        # project.init event by calling init() itself — it now guards on
+        # existing events.
+        cls.init(root, id_prefix=project.cfg.id_prefix, name=project.cfg.name)
+        events.append(project.events_path, "project.migrate",
+                      data={"from_version": "<=pre-migrate>"})
+        return cls.load(root)
+
+    # ---- paths ----
+
+    @property
+    def hw_dir(self) -> Path:
+        return paths.hw_dir(self.root)
+
+    @property
+    def nodes_dir(self) -> Path:
+        return self.hw_dir / "nodes"
+
+    @property
+    def events_path(self) -> Path:
+        return self.hw_dir / "events.jsonl"
+
+    @property
+    def edges_path(self) -> Path:
+        return self.hw_dir / "edges.jsonl"
+
+    @property
+    def views_dir(self) -> Path:
+        return self.hw_dir / "views"
+
+    @property
+    def attestations_path(self) -> Path:
+        return self.hw_dir / "attestations.jsonl"
+
+    @property
+    def agents_path(self) -> Path:
+        return self.hw_dir / "agents.jsonl"
+
+    @property
+    def agent_registry(self) -> AgentRegistry:
+        if self._agent_registry is None:
+            self._agent_registry = AgentRegistry(self.agents_path)
+        return self._agent_registry
+
+    def _fingerprint_for(self, actor: Optional[str]) -> Optional[str]:
+        """Look up `actor`'s current fingerprint in the agent registry."""
+        if not actor:
+            return None
+        rec = self.agent_registry.get(actor)
+        return rec.current_fingerprint if rec else None
+
+    def _attest(self, *, kind: str, node: Optional[str], actor: Optional[str],
+                commit: Optional[str] = None, reason: Optional[str] = None,
+                evidence: Optional[List[str]] = None,
+                data: Optional[Dict[str, Any]] = None) -> None:
+        """Emit an attestation alongside the event log. Idempotent + append-only."""
+        fp = self._fingerprint_for(actor)
+        att_mod.record(
+            self.attestations_path,
+            kind=kind, node=node, actor=actor,
+            fingerprint_hex=fp, commit=commit, reason=reason,
+            evidence=evidence, data=data,
+        )
+
+    # ---- node id generator ----
+
+    def next_node_id(self) -> str:
+        prefix = self.cfg.id_prefix
+        pad = self.cfg.id_pad
+        existing: List[int] = []
+        for p in self.nodes_dir.glob(f"{prefix}-*.md"):
+            try:
+                _, n = parse_node_id(p.stem)
+                existing.append(n)
+            except ValueError:
+                continue
+        next_n = (max(existing) + 1) if existing else 1
+        return format_node_id(prefix, next_n, pad=pad)
+
+    # ---- CRUD ----
+
+    def new_node(self, *, components: List[str], title: str,
+                 owner: Optional[str] = None,
+                 parent: Optional[str] = None,
+                 priority: str = "P2",
+                 status: NodeStatus = NodeStatus.idea,
+                 actor: Optional[str] = None) -> Node:
+        errors = self.registry.validate_node_components(components)
+        if errors:
+            raise ValueError("; ".join(errors))
+        node_id = self.next_node_id()
+        node = Node(
+            id=node_id,
+            title=title,
+            status=status,
+            priority=priority,
+            owner=owner,
+            project=self.cfg.name,
+            parent=parent,
+            components=list(components),
+        )
+        self.save_node(node)
+        events.append(self.events_path, "node.create", node=node_id, actor=actor,
+                      data={"components": node.components, "title": title})
+        self._attest(kind="node.create", node=node_id, actor=actor,
+                     data={"components": node.components, "title": title})
+        return node
+
+    def save_node(self, node: Node) -> None:
+        storage.write_node_file(self.node_path(node.id), node)
+
+    def node_path(self, node_id: str) -> Path:
+        return self.nodes_dir / f"{node_id}.md"
+
+    def node(self, node_id: str) -> Node:
+        path = self.node_path(node_id)
+        if not path.is_file():
+            raise FileNotFoundError(f"node not found: {node_id}")
+        return storage.read_node_file(path)
+
+    def has_node(self, node_id: str) -> bool:
+        return self.node_path(node_id).is_file()
+
+    def all_nodes(self) -> List[Node]:
+        out: List[Node] = []
+        for p in sorted(self.nodes_dir.glob("*.md")):
+            try:
+                out.append(storage.read_node_file(p))
+            except Exception:
+                continue
+        return out
+
+    def delete_node(self, node_id: str, *, actor: Optional[str] = None) -> None:
+        path = self.node_path(node_id)
+        if path.is_file():
+            path.unlink()
+            events.append(self.events_path, "node.delete", node=node_id, actor=actor)
+
+    # ---- mutations ----
+
+    def set_status(self, node_id: str, new_status: NodeStatus, *,
+                   actor: Optional[str] = None, reason: Optional[str] = None) -> Node:
+        node = self.node(node_id)
+        old = node.status if isinstance(node.status, NodeStatus) else NodeStatus(node.status)
+        if old == new_status:
+            return node
+        if not node.can_transition_to(new_status):
+            raise ValueError(
+                f"illegal status transition {old.value} -> {new_status.value} "
+                f"(node {node_id}); allowed from {old.value}: "
+                f"{sorted(s.value for s in STATUS_TRANSITIONS.get(old, set()))}"
+            )
+        node.status = new_status
+        node.updated = _now()
+        self.save_node(node)
+        events.append(self.events_path, "node.status.change", node=node_id, actor=actor,
+                      data={"from": old.value, "to": new_status.value, "reason": reason})
+        self._attest(kind="node.status.change", node=node_id, actor=actor, reason=reason,
+                     data={"from": old.value, "to": new_status.value})
+        return node
+
+    def touch(self, node_id: str, note: str, *, actor: Optional[str] = None) -> Node:
+        node = self.node(node_id)
+        ts = _now()
+        who = actor or "unknown"
+        node.notes.append(f"{ts} [{who}]  {note}")
+        node.updated = ts
+        self.save_node(node)
+        events.append(self.events_path, "node.touch", node=node_id, actor=actor,
+                      data={"note": note})
+        self._attest(kind="node.touch", node=node_id, actor=actor, data={"note": note})
+        return node
+
+    def link(self, from_id: str, kind: EdgeKind, to_id: str, *,
+             artifact: Optional[str] = None, reason: Optional[str] = None,
+             actor: Optional[str] = None) -> Edge:
+        if not self.has_node(from_id):
+            raise FileNotFoundError(f"node not found: {from_id}")
+        # `references` (HW-0033) may point back at a node id OR a spec-file
+        # path (e.g. a comment-review promoted from a comment on specs/x.md).
+        # Only enforce node existence when the target looks like a node id.
+        if kind in (EdgeKind.blocks, EdgeKind.parent, EdgeKind.related) and not self.has_node(to_id):
+            raise FileNotFoundError(f"node not found: {to_id}")
+        if kind == EdgeKind.references:
+            try:
+                parse_node_id(to_id)
+                looks_like_node = True
+            except ValueError:
+                looks_like_node = False
+            if looks_like_node and not self.has_node(to_id):
+                raise FileNotFoundError(f"node not found: {to_id}")
+
+        # v0.6.1: cycle detection — blocks edges are the only execution-ordering
+        # constraint, so they're the only kind that can create execution cycles.
+        # Refuse the edge with a typed error and a path; the caller's job is to
+        # break the cycle (consult the orchestrator to replan into smaller chunks).
+        if kind == EdgeKind.blocks:
+            cycle = self._would_create_cycle(from_id, to_id)
+            if cycle:
+                raise CircularDependencyError(from_id=from_id, to_id=to_id, cycle=cycle)
+
+        src = self.node(from_id)
+        if kind == EdgeKind.blocks:
+            if to_id not in src.blocks:
+                src.blocks.append(to_id)
+            dst = self.node(to_id)
+            if from_id not in dst.blocked_by:
+                dst.blocked_by.append(from_id)
+            self.save_node(dst)
+        elif kind == EdgeKind.parent:
+            dst = self.node(to_id)
+            dst.parent = from_id
+            self.save_node(dst)
+        elif kind == EdgeKind.related:
+            if to_id not in src.related:
+                src.related.append(to_id)
+        elif kind == EdgeKind.references:
+            if to_id not in src.references:
+                src.references.append(to_id)
+        elif kind == EdgeKind.produces:
+            src.outputs.append(NodeOutput(path=to_id, kind=artifact or "artifact"))
+        elif kind == EdgeKind.consumes:
+            # to_id is the upstream node, artifact is the path
+            src.inputs.append(NodeInput(from_node=to_id, artifact=artifact))
+        self.save_node(src)
+
+        edge = Edge(from_id=from_id, to_id=to_id, kind=kind, artifact=artifact, reason=reason)
+        with self.edges_path.open("a", encoding="utf-8", newline="\n") as f:
+            f.write(self._edge_to_json(edge) + "\n")
+        events.append(self.events_path, "edge.create", actor=actor, data={
+            "from": from_id, "to": to_id, "kind": kind.value, "artifact": artifact, "reason": reason
+        })
+        self._attest(kind="edge.create", node=from_id, actor=actor, reason=reason,
+                     data={"from": from_id, "to": to_id, "kind": kind.value,
+                           "artifact": artifact})
+        return edge
+
+    def close(self, node_id: str, *, commit: Optional[str] = None,
+              reason: Optional[str] = None, actor: Optional[str] = None) -> Node:
+        node = self.node(node_id)
+        cur = node.status if isinstance(node.status, NodeStatus) else NodeStatus(node.status)
+        # Walk toward done via the permitted path.
+        sequence = {
+            NodeStatus.idea: [NodeStatus.ready, NodeStatus.doing, NodeStatus.review, NodeStatus.done],
+            NodeStatus.blocked: [NodeStatus.ready, NodeStatus.doing, NodeStatus.review, NodeStatus.done],
+            NodeStatus.ready: [NodeStatus.doing, NodeStatus.review, NodeStatus.done],
+            NodeStatus.doing: [NodeStatus.review, NodeStatus.done],
+            NodeStatus.review: [NodeStatus.done],
+            NodeStatus.done: [],
+        }.get(cur, [NodeStatus.done])
+        for s in sequence:
+            self.set_status(node_id, s, actor=actor, reason=reason)
+        closing_note = f"closed" + (f" by commit {commit}" if commit else "") + \
+                       (f" - {reason}" if reason else "")
+        self.touch(node_id, closing_note, actor=actor)
+        # Emit an explicit "node.close" attestation carrying commit + evidence so
+        # quality metrics can trace closed-by-<fingerprint> cheaply.
+        evidence = []
+        if commit:
+            evidence.append(f"commit:{commit}")
+        self._attest(kind="node.close", node=node_id, actor=actor, commit=commit,
+                     reason=reason, evidence=evidence or None)
+        return self.node(node_id)
+
+    # ---- cycle detection (v0.6.1) ----
+
+    def _would_create_cycle(self, from_id: str, to_id: str) -> List[str]:
+        """If adding `from_id --[blocks]--> to_id` would create a cycle in the
+        existing blocks-graph, return the path that closes it. Empty list
+        otherwise.
+
+        Detection: walk the existing blocks graph starting from `to_id`. If we
+        reach `from_id`, there's already a path `to_id -> ... -> from_id`, so
+        adding `from_id -> to_id` closes the loop.
+        """
+        if from_id == to_id:
+            return [from_id]
+        # Build the current blocks-graph cheaply (only the edge.kind we care about).
+        nodes = {n.id: n for n in self.all_nodes()}
+        if to_id not in nodes:
+            return []
+        visited: Set[str] = set()
+        # BFS with parent tracking so we can reconstruct the path
+        parent: Dict[str, str] = {to_id: ""}
+        frontier: List[str] = [to_id]
+        while frontier:
+            cur = frontier.pop(0)
+            if cur == from_id:
+                # Reconstruct path from `to_id` back to `from_id`
+                path: List[str] = []
+                node_id: Optional[str] = cur
+                while node_id:
+                    path.append(node_id)
+                    nxt = parent.get(node_id)
+                    node_id = nxt if nxt else None
+                return list(reversed(path))
+            if cur in visited:
+                continue
+            visited.add(cur)
+            cur_node = nodes.get(cur)
+            if not cur_node:
+                continue
+            for nxt in cur_node.blocks:
+                if nxt not in visited:
+                    parent.setdefault(nxt, cur)
+                    frontier.append(nxt)
+        return []
+
+    # ---- flow (HW-0028) ----
+    # Thin wrappers around `hopewell.flow`. The flow module owns the
+    # actual logic (events + NodeLocation mutation); Project mirrors the
+    # v0.4 attestation pattern so every flow op is recorded alongside
+    # the event log.
+
+    def flow_enter(self, node_id: str, executor_id: str, *,
+                   artifact: Optional[str] = None, reason: Optional[str] = None,
+                   actor: Optional[str] = None) -> bool:
+        from taskflow import flow as flow_mod
+        added = flow_mod.enter(self, node_id, executor_id,
+                               artifact=artifact, reason=reason, actor=actor)
+        if added:
+            self._attest(kind="flow.enter", node=node_id, actor=actor,
+                         reason=reason,
+                         data={"executor": executor_id, "artifact": artifact})
+        return added
+
+    def flow_leave(self, node_id: str, executor_id: str, *,
+                   reason: Optional[str] = None,
+                   actor: Optional[str] = None) -> bool:
+        from taskflow import flow as flow_mod
+        closed = flow_mod.leave(self, node_id, executor_id,
+                                reason=reason, actor=actor)
+        if closed:
+            self._attest(kind="flow.leave", node=node_id, actor=actor,
+                         reason=reason, data={"executor": executor_id})
+        return closed
+
+    def flow_push(self, node_id: str, to_executor: str, *,
+                  from_executor: Optional[str] = None,
+                  artifact: Optional[str] = None,
+                  reason: Optional[str] = None,
+                  actor: Optional[str] = None) -> Dict[str, Any]:
+        from taskflow import flow as flow_mod
+        ev = flow_mod.push(self, node_id, to_executor,
+                           from_executor=from_executor, artifact=artifact,
+                           reason=reason, actor=actor)
+        self._attest(kind="flow.push", node=node_id, actor=actor, reason=reason,
+                     data={"from": from_executor, "to": to_executor,
+                           "artifact": artifact})
+        return ev
+
+    def flow_ack(self, node_id: str, executor_id: str, *,
+                 outcome: str = "processed", note: Optional[str] = None,
+                 actor: Optional[str] = None) -> Dict[str, Any]:
+        from taskflow import flow as flow_mod
+        ev = flow_mod.ack(self, node_id, executor_id,
+                          outcome=outcome, note=note, actor=actor)
+        self._attest(kind="flow.ack", node=node_id, actor=actor,
+                     data={"executor": executor_id, "outcome": outcome,
+                           "note": note})
+        return ev
+
+    def flow_inbox(self, executor_id: str) -> List[Dict[str, Any]]:
+        from taskflow import flow as flow_mod
+        return flow_mod.inbox(self, executor_id)
+
+    def flow_where(self, node_id: str) -> List[Dict[str, Any]]:
+        from taskflow import flow as flow_mod
+        return flow_mod.where(self, node_id)
+
+    # ---- integrity ----
+
+    def check(self) -> List[str]:
+        """Validate the graph. Returns a list of problems; empty = clean."""
+        problems: List[str] = []
+        all_nodes = {n.id: n for n in self.all_nodes()}
+
+        for n in all_nodes.values():
+            # component validation
+            for err in self.registry.validate_node_components(n.components):
+                problems.append(f"{n.id}: {err}")
+            # dangling refs
+            for ref in n.blocks:
+                if ref not in all_nodes:
+                    problems.append(f"{n.id}: blocks unknown node {ref}")
+            for ref in n.blocked_by:
+                if ref not in all_nodes:
+                    problems.append(f"{n.id}: blocked_by unknown node {ref}")
+            for ref in n.related:
+                if ref not in all_nodes:
+                    problems.append(f"{n.id}: related unknown node {ref}")
+            if n.parent and n.parent not in all_nodes:
+                problems.append(f"{n.id}: parent unknown node {n.parent}")
+            for i in n.inputs:
+                if i.from_node and i.from_node not in all_nodes:
+                    problems.append(f"{n.id}: input references unknown node {i.from_node}")
+
+        # Cycle detection (via blocks edges)
+        adj: Dict[str, List[str]] = {nid: list(n.blocks) for nid, n in all_nodes.items()}
+        for cyc in _find_cycles(adj):
+            problems.append("cycle: " + " -> ".join(cyc + [cyc[0]]))
+
+        return problems
+
+    # ---- helpers ----
+
+    def _edge_to_json(self, e: Edge) -> str:
+        import json
+        return json.dumps({
+            "ts": e.created,
+            "from": e.from_id,
+            "to": e.to_id,
+            "kind": e.kind.value if isinstance(e.kind, EdgeKind) else e.kind,
+            "artifact": e.artifact,
+            "reason": e.reason,
+        }, sort_keys=True, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# cycle detection
+# ---------------------------------------------------------------------------
+
+def _find_cycles(adj: Dict[str, List[str]]) -> List[List[str]]:
+    WHITE, GRAY, BLACK = 0, 1, 2
+    colour: Dict[str, int] = {n: WHITE for n in adj}
+    stack: List[str] = []
+    cycles: List[List[str]] = []
+
+    def visit(n: str) -> None:
+        colour[n] = GRAY
+        stack.append(n)
+        for m in adj.get(n, []):
+            if m not in colour:
+                continue
+            if colour[m] == GRAY:
+                # Cycle from stack[stack.index(m):]
+                cycle = stack[stack.index(m):]
+                cycles.append(list(cycle))
+            elif colour[m] == WHITE:
+                visit(m)
+        stack.pop()
+        colour[n] = BLACK
+
+    for n in list(adj.keys()):
+        if colour[n] == WHITE:
+            visit(n)
+    return cycles
+
+
+# ---------------------------------------------------------------------------
+# time
+# ---------------------------------------------------------------------------
+
+def _now() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class CircularDependencyError(ValueError):
+    """Raised when adding an edge would create a cycle in the blocks-graph.
+
+    The error carries the would-be edge plus the existing path that closes
+    the cycle so the caller (or the orchestrator they consult) can see
+    exactly what to break up.
+    """
+
+    def __init__(self, *, from_id: str, to_id: str, cycle: List[str]) -> None:
+        # `cycle` is the existing path from `to_id` reaching `from_id`. Adding
+        # the proposed edge `from_id -> to_id` would close the loop, so the
+        # full circle reads: cycle (to_id -> ... -> from_id) -> to_id.
+        if from_id == to_id:
+            full = f"{from_id} -> {from_id}"
+        else:
+            full = " -> ".join(cycle) + f" -> {to_id}"
+        super().__init__(
+            f"adding `blocks` edge {from_id} -> {to_id} would create a cycle: "
+            f"{full}. Hopewell can't process circular dependencies. Consult "
+            f"the orchestrator to break this work into smaller chunks before "
+            f"linking."
+        )
+        self.from_id = from_id
+        self.to_id = to_id
+        self.cycle = cycle
+
+
+def _has_project_init_event(events_path: Path) -> bool:
+    """Cheap scan for a prior project.init event; used to keep init idempotent."""
+    if not events_path.is_file():
+        return False
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"kind": "project.init"' in line or '"kind":"project.init"' in line:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Merge driver + .gitattributes installer (v0.5)
+# ---------------------------------------------------------------------------
+
+
+_GITATTR_LINES = [
+    ".hopewell/events.jsonl        merge=hopewell-jsonl",
+    ".hopewell/attestations.jsonl  merge=hopewell-jsonl",
+    ".hopewell/edges.jsonl         merge=hopewell-jsonl",
+    ".hopewell/agents.jsonl        merge=hopewell-jsonl",
+]
+
+_GITATTR_MARKER = "# --- hopewell jsonl merge driver (managed) ---"
+_GITATTR_END = "# --- /hopewell jsonl merge driver ---"
+
+
+def _install_merge_driver(project_root: Path) -> None:
+    """Write .gitattributes block + configure `merge.hopewell-jsonl.driver`.
+
+    Silently no-ops if we're not in a git worktree — the project still works
+    without the driver; it just means git-level conflicts on jsonl files
+    would need manual resolution.
+    """
+    gitattr = project_root / ".gitattributes"
+    existing = gitattr.read_text(encoding="utf-8") if gitattr.is_file() else ""
+    if _GITATTR_MARKER not in existing:
+        block = (
+            ("\n" if existing and not existing.endswith("\n") else "")
+            + f"{_GITATTR_MARKER}\n"
+            + "\n".join(_GITATTR_LINES) + "\n"
+            + f"{_GITATTR_END}\n"
+        )
+        gitattr.write_text(existing + block, encoding="utf-8")
+
+    if (project_root / ".git").exists():
+        try:
+            subprocess.run(
+                ["git", "config", "merge.hopewell-jsonl.driver",
+                 "taskflow merge-driver jsonl %O %A %B"],
+                cwd=str(project_root), check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "config", "merge.hopewell-jsonl.name",
+                 "Hopewell JSONL timestamp-sorted merge"],
+                cwd=str(project_root), check=True, capture_output=True, timeout=10,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass

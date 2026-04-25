@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hopewell"
-version = "0.16.0"
+name = "taskflow"
+version = "0.17.0"
 description = "Flow-framework tool for AI-agent-driven work: composition-over-typing node graph, parallel scheduler, orchestrator, and web UI. Replaces ticket trackers with a graph that agents can execute."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Christopher Gulliver" }]
-keywords = ["hopewell", "flow", "flow-framework", "tickets", "issue-tracker", "orchestration", "ai", "agents", "dag", "workflow"]
+keywords = ["taskflow", "hopewell", "flow", "flow-framework", "tickets", "issue-tracker", "orchestration", "ai", "agents", "dag", "workflow"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -53,12 +53,17 @@ Repository = "https://github.com/ocgully/Hopewell"
 Issues = "https://github.com/ocgully/Hopewell/issues"
 
 [project.scripts]
-hopewell = "hopewell.cli:main"
-hw = "hopewell.cli:main"
+# New primary entry point.
+taskflow = "taskflow.cli:main"
+tf = "taskflow.cli:main"
+# Legacy entry points kept as deprecation aliases for two minor cycles.
+# Both print a stderr warning and forward to `main`.
+hopewell = "taskflow.cli:main_deprecated_alias"
+hw = "taskflow.cli:main_deprecated_alias"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["hopewell*"]
+include = ["taskflow*"]
 
 [tool.setuptools.package-data]
-hopewell = ["web/static/*", "web/static/**/*", "templates/*"]
+taskflow = ["web/static/*", "web/static/**/*", "templates/*"]

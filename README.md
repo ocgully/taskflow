@@ -1,4 +1,19 @@
-# Hopewell
+# TaskFlow (formerly Hopewell)
+
+> **Renamed from `hopewell` (April 2026).** Package, CLI, and on-disk dir
+> all migrate from `hopewell` / `.hopewell/` to `taskflow` / `.taskflow/`.
+> The legacy `hopewell` and `hw` CLI entry points still install as
+> deprecation aliases — they print a stderr warning ("'hopewell' is the
+> legacy name for taskflow; this alias will be removed in v2.0") and
+> forward to `taskflow`. The legacy `.hopewell/` directory is auto-detected
+> on read; migrate in-place with `taskflow migrate-from-hopewell`. Aliases
+> kept for two minor cycles.
+>
+> **Ticket IDs are immutable.** Existing `HW-NNNN` IDs keep their `HW-`
+> prefix forever. New tickets created post-rebrand use `TF-NNNN` (the new
+> default `id_prefix` in fresh project configs). Existing projects with
+> `id_prefix = "HW"` in their `config.toml` continue to allocate `HW-`
+> IDs unless explicitly changed.
 
 **Flow-framework tool for AI-agent-driven work.** Composition-over-typing
 node graph, parallel scheduler, orchestrator, GitHub-issues ingestion, and
@@ -8,9 +23,11 @@ components riding a DAG that agents can execute.
 Named after a ship in *Gulliver's Travels*. Work *sails* through a network
 of ports (nodes), carrying cargo (artifacts).
 
-> **Flotilla plugin.** Hopewell ships a `plugin/` directory + `flotilla.yaml`
-> at the repo root, so downstream projects can install it via
-> `flotilla install hopewell`. See [`plugin/README.md`](plugin/README.md).
+> **Flotilla plugin.** TaskFlow ships a `plugin/` directory +
+> `flotilla.yaml` at the repo root, so downstream projects can install it
+> via `flotilla install taskflow` (or the legacy `flotilla install
+> hopewell`, which resolves through the alias). See
+> [`plugin/README.md`](plugin/README.md).
 
 > **Status: v0.5.** CLI + Python library + basic orchestrator + GitHub
 > ingestion + attestation ledger + agent fingerprinting + **coordination

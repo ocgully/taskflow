@@ -1,0 +1,1404 @@
+"""FastAPI server + SSE bridge for the Hopewell local web UI.
+
+Design notes:
+
+* Optional extra. All web-only imports (fastapi, uvicorn, watchdog) live
+  behind a lazy guard so that someone who installed plain `hopewell`
+  without `[web]` gets a clear, single-line error — not a traceback.
+* Read-mostly. All mutations still go through `hopewell.project.Project`
+  (i.e. the same code path the CLI uses); the server never touches
+  `.hopewell/` files directly, it just reflects them back over HTTP.
+* Realtime via watchdog. A FileSystemEventHandler watches
+  `.hopewell/events.jsonl` for modifications and fans new tail-lines out
+  to any open SSE subscriber queue.
+* Static frontend. No build step — `static/index.html` loads Preact + D3
+  as ES modules from esm.sh. The server only serves the three static
+  files and the JSON API.
+
+CLI entry: `hopewell.web.server.run(project_root, port, open_browser)`.
+cli.py wires `hopewell web` to this; we don't touch cli.py from here.
+
+NOTE: we deliberately do NOT use `from __future__ import annotations`
+here. FastAPI uses `typing.get_type_hints()` to resolve parameter types
+for dependency injection; with stringified annotations it evaluates
+them in the module's globals, where `Request` is not visible because
+web-only imports live inside `create_app`. Keeping annotations live
+sidesteps that trap.
+"""
+
+import asyncio
+import json
+import sys
+import threading
+import time
+import webbrowser
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Optional-extra guard
+# ---------------------------------------------------------------------------
+
+_MISSING_EXTRAS_HINT = (
+    "Hopewell's web UI requires the `[web]` extra.\n"
+    "Install it with:\n"
+    "    pip install 'hopewell[web]'\n"
+    "(brings in fastapi, uvicorn, watchdog)."
+)
+
+
+def _require_web_extras() -> None:
+    missing: List[str] = []
+    for mod in ("fastapi", "uvicorn", "watchdog"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        sys.stderr.write(
+            f"hopewell web: missing extras ({', '.join(missing)}).\n"
+            f"{_MISSING_EXTRAS_HINT}\n"
+        )
+        raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# Event bus
+# ---------------------------------------------------------------------------
+
+
+class EventBus:
+    """Tiny in-memory fan-out. One queue per connected SSE subscriber.
+
+    We keep the queues bounded so a slow client can't eat all our RAM —
+    if a queue is full we drop the oldest message (reconnect will
+    resync via /api/state anyway).
+    """
+
+    def __init__(self, max_queue: int = 256) -> None:
+        self._subscribers: "List[asyncio.Queue[str]]" = []
+        self._lock = asyncio.Lock()
+        self._max_queue = max_queue
+
+    async def subscribe(self) -> "asyncio.Queue[str]":
+        q: "asyncio.Queue[str]" = asyncio.Queue(maxsize=self._max_queue)
+        async with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    async def unsubscribe(self, q: "asyncio.Queue[str]") -> None:
+        async with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    async def publish(self, payload: str) -> None:
+        async with self._lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                # drop oldest; clients reconnect-and-resync is fine
+                try:
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Events.jsonl tailer
+# ---------------------------------------------------------------------------
+
+
+class EventsTailer:
+    """Watchdog-driven tail of `.hopewell/events.jsonl`.
+
+    Remembers byte offset of last-sent line; on file-modified, reads
+    new lines and hands each (parsed) event to `on_event`. Robust to
+    file rotation (offset reset on shrink).
+    """
+
+    def __init__(self, events_path: Path, on_event) -> None:
+        self.events_path = events_path
+        self.on_event = on_event          # callable(dict)
+        self._offset = 0
+        self._lock = threading.Lock()
+        # Seed offset at EOF so we only emit *new* events after startup.
+        if events_path.is_file():
+            self._offset = events_path.stat().st_size
+
+    def drain_new(self) -> None:
+        """Read any new bytes and fire on_event for each new line."""
+        with self._lock:
+            if not self.events_path.is_file():
+                return
+            size = self.events_path.stat().st_size
+            if size < self._offset:
+                # Rotation / truncation — start from 0.
+                self._offset = 0
+            if size == self._offset:
+                return
+            try:
+                with self.events_path.open("rb") as f:
+                    f.seek(self._offset)
+                    chunk = f.read()
+                    self._offset = f.tell()
+            except OSError:
+                return
+        # Parse + dispatch outside the lock.
+        for raw in chunk.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            try:
+                self.on_event(ev)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+
+def _slice_key(path: Optional[str], anchor: Optional[str],
+               lines: Optional[List[int]]) -> str:
+    """Compose a stable key for a slice so ref metadata + drift can be joined.
+
+    Mirrors `spec_input._slice_match` comparison semantics (anchor wins
+    over lines if present). Kept lightweight — just enough to look up an
+    entry computed from `drift()`.
+    """
+    if anchor:
+        return f"{path or ''}|a:{anchor.strip()}"
+    if lines and len(lines) >= 2:
+        return f"{path or ''}|l:{int(lines[0])}-{int(lines[1])}"
+    return f"{path or ''}|?"
+
+
+def _load_project(project_root: Path):
+    """Load a Hopewell project, surface a readable error if `.hopewell/` is absent."""
+    from taskflow.project import Project
+    try:
+        return Project.load(project_root)
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(
+            f"hopewell web: could not load project at {project_root}: {e}\n"
+            f"Run `taskflow init` in a project directory first."
+        )
+
+
+def _state_snapshot(project) -> Dict[str, Any]:
+    """Compose the /api/state payload — nodes, edges, UAT, claims, waves."""
+    from taskflow import query as query_mod
+    from taskflow import uat as uat_mod
+
+    graph = query_mod.graph(project)
+    # Derive "systems" = distinct parent chains (roots + groupings).
+    roots: List[Dict[str, Any]] = []
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    for n in graph["nodes"]:
+        if not n.get("parent"):
+            roots.append({"id": n["id"], "title": n["title"], "status": n["status"]})
+
+    try:
+        uat_items = uat_mod.list_uat(project, status="all")
+    except Exception:
+        uat_items = []
+
+    try:
+        claim_items = query_mod.claims(project).get("claims", [])
+    except Exception:
+        claim_items = []
+
+    try:
+        waves_payload = query_mod.waves(project)["stack"]
+    except Exception:
+        waves_payload = {"waves": [], "critical_path": [], "depth": 0, "max_width": 0}
+
+    from taskflow import __version__ as hw_version
+    return {
+        "project": {
+            "name": project.cfg.name,
+            "root": str(project.root),
+            "id_prefix": project.cfg.id_prefix,
+        },
+        "hopewell_version": hw_version,
+        "systems": roots,
+        "nodes": graph["nodes"],
+        "edges": graph["edges"],
+        "uat": uat_items,
+        "claims": claim_items,
+        "waves": waves_payload,
+    }
+
+
+def create_app(project_root: Path):
+    """Build the FastAPI app. Called by `run`; factored for tests."""
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import FileResponse, StreamingResponse
+    from fastapi.staticfiles import StaticFiles
+    from starlette.requests import Request
+
+    project_root = project_root.resolve()
+    project = _load_project(project_root)
+
+    app = FastAPI(title="Hopewell Web UI", version="0.6.0-dev")
+    bus = EventBus()
+    loop_ref: Dict[str, Any] = {"loop": None}   # set at startup
+
+    static_dir = Path(__file__).parent / "static"
+
+    # ---- static ---------------------------------------------------------
+    @app.get("/", include_in_schema=False)
+    def _index() -> FileResponse:
+        return FileResponse(static_dir / "index.html")
+
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    # ---- JSON API -------------------------------------------------------
+    @app.get("/api/health")
+    def _health() -> Dict[str, Any]:
+        return {"ok": True, "project": project.cfg.name, "root": str(project.root)}
+
+    @app.get("/api/state")
+    def _state() -> Dict[str, Any]:
+        # Re-load on every call — cheap on small projects, always fresh.
+        p = _load_project(project_root)
+        return _state_snapshot(p)
+
+    @app.get("/api/node/{node_id}")
+    def _node(node_id: str) -> Dict[str, Any]:
+        from taskflow import query as query_mod
+        p = _load_project(project_root)
+        try:
+            return query_mod.show(p, node_id)["node"]
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+
+    # ---- Markdown-viewer endpoints (HW-0032) ----------------------------
+    #
+    # Three routes power the viewer:
+    #   GET /api/doc/{node_id}       — raw node .md + metadata
+    #   GET /api/spec?path=...       — raw spec file + the slices recorded
+    #                                  for it across all nodes + drift per
+    #                                  consumer so the viewer can render
+    #                                  drift badges without extra calls.
+    #   POST /api/node/{node_id}/spec-repin — re-record slice hash against
+    #                                  current file content (idempotent add).
+    #
+    # Path safety: all filesystem reads are anchored to project_root via
+    # `_resolve_project_rel_path`, which refuses anything that escapes the
+    # repo via `..` or an absolute path. Spec files can live anywhere
+    # under the project root (not just inside .hopewell/).
+
+    def _resolve_project_rel_path(rel: str) -> Path:
+        """Resolve `rel` against the project root, refusing path traversal.
+
+        Raises HTTPException(400) on traversal attempts and HTTPException(404)
+        if the resolved path is not a readable file.
+        """
+        if not rel or not isinstance(rel, str):
+            raise HTTPException(status_code=400, detail="path required")
+        # Reject absolute paths outright.
+        candidate = Path(rel)
+        if candidate.is_absolute():
+            raise HTTPException(status_code=400, detail="absolute paths not allowed")
+        resolved = (project_root / candidate).resolve()
+        try:
+            resolved.relative_to(project_root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="path escapes project root")
+        if not resolved.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {rel}")
+        return resolved
+
+    @app.get("/api/doc/{node_id}")
+    def _doc(node_id: str) -> Dict[str, Any]:
+        """Return the raw node .md contents + a compact node summary.
+
+        The viewer renders the full markdown (body + notes) client-side so
+        fenced code blocks (mermaid / plantuml) render inline. Spec refs
+        are returned pre-expanded so the viewer can render slice overlays
+        without a second roundtrip per reference.
+        """
+        from taskflow import query as query_mod
+        from taskflow import spec_input as spec_mod
+        p = _load_project(project_root)
+        try:
+            node_summary = query_mod.show(p, node_id)["node"]
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+
+        node_md_path = p.node_path(node_id)
+        try:
+            md_text = node_md_path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"cannot read node file: {e}")
+
+        # Enumerate spec refs with drift so the viewer can render badges inline.
+        try:
+            refs = spec_mod.ls_spec_refs(p, node_id)
+        except Exception:
+            refs = []
+        drift_entries: List[Dict[str, Any]] = []
+        try:
+            drift_entries = spec_mod.drift(p, node_id, patch=True)
+        except Exception:
+            drift_entries = []
+        # Index drift by (path, anchor, lines-tuple) so refs can lookup.
+        drift_by_key: Dict[str, Dict[str, Any]] = {}
+        for d in drift_entries:
+            key = _slice_key(d.get("path"), d.get("anchor"), d.get("lines_was"))
+            drift_by_key[key] = d
+
+        spec_refs_out: List[Dict[str, Any]] = []
+        for r in refs:
+            key = _slice_key(r.get("path"), r.get("anchor"), r.get("lines"))
+            d = drift_by_key.get(key, {})
+            spec_refs_out.append({
+                "path": r.get("path"),
+                "anchor": r.get("anchor"),
+                "lines": r.get("lines"),
+                "slice_sha": r.get("slice_sha"),
+                "why": r.get("why"),
+                "state": d.get("state") or "unknown",
+                "lines_now": d.get("lines_now"),
+                "slice_sha_now": d.get("slice_sha_now"),
+                "patch": d.get("patch"),
+            })
+
+        return {
+            "node": node_summary,
+            "node_md_path": str(node_md_path.relative_to(project_root)).replace("\\", "/"),
+            "markdown": md_text,
+            "spec_refs": spec_refs_out,
+        }
+
+    @app.get("/api/spec")
+    def _spec(path: str) -> Dict[str, Any]:
+        """Return a spec file's text + the slices any nodes have pinned on it.
+
+        The viewer renders only the pinned line ranges by default and uses
+        the `text` payload for expand-context-on-click. Line numbers in
+        the response are 1-based inclusive to match `spec_input.py`.
+
+        Shape:
+            {
+              "path": "specs/002/spec.md",
+              "text": "...full file text...",
+              "line_count": N,
+              "consumers": [
+                { "node": "SM-0001", "title": "...", "status": "doing",
+                  "slices": [ {anchor, lines, slice_sha, why,
+                               state, lines_now, slice_sha_now, patch} ] }
+              ]
+            }
+        """
+        from taskflow import spec_input as spec_mod
+        p = _load_project(project_root)
+        resolved = _resolve_project_rel_path(path)
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"cannot read file: {e}")
+
+        # Normalise path for storage comparison (matches spec_input._normalise_path).
+        rel_posix = str(resolved.relative_to(project_root)).replace("\\", "/")
+
+        # Consumers of this spec (any slice).
+        try:
+            consumers_list = spec_mod.consumers(p, rel_posix)
+        except Exception:
+            consumers_list = []
+
+        # For each consumer, compute per-slice drift.
+        for c in consumers_list:
+            try:
+                drift_entries = spec_mod.drift(p, c["node"], patch=True)
+            except Exception:
+                drift_entries = []
+            dbk: Dict[str, Dict[str, Any]] = {}
+            for d in drift_entries:
+                if d.get("path") != rel_posix:
+                    continue
+                k = _slice_key(d.get("path"), d.get("anchor"), d.get("lines_was"))
+                dbk[k] = d
+            for sl in c.get("slices", []):
+                k = _slice_key(rel_posix, sl.get("anchor"), sl.get("lines"))
+                d = dbk.get(k, {})
+                sl["state"] = d.get("state") or "unknown"
+                sl["lines_now"] = d.get("lines_now")
+                sl["slice_sha_now"] = d.get("slice_sha_now")
+                sl["patch"] = d.get("patch")
+
+        # Split lines for fast client-side slicing (also gives accurate count).
+        lines = text.split("\n")
+        # Keep trailing newline handling consistent with spec_input.
+        if lines and lines[-1] == "":
+            lines.pop()
+
+        return {
+            "path": rel_posix,
+            "text": text,
+            "line_count": len(lines),
+            "consumers": consumers_list,
+        }
+
+    @app.post("/api/node/{node_id}/spec-repin")
+    async def _spec_repin(node_id: str, request: Request) -> Dict[str, Any]:
+        """Re-pin a drifted slice against the current file content.
+
+        Body: `{"path": "...", "anchor": "## Heading"}` OR
+              `{"path": "...", "lines": [start, end]}`
+
+        Uses `spec_input.add_spec_ref` which is idempotent — calling it
+        with the same heading/lines updates the recorded hash + lines to
+        whatever the file says now.
+        """
+        from taskflow import spec_input as spec_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        path = body.get("path")
+        if not path:
+            raise HTTPException(status_code=400, detail="`path` required")
+        anchor = body.get("anchor")
+        lines = body.get("lines")
+        lines_tuple: Optional[tuple] = None
+        if lines:
+            try:
+                lines_tuple = (int(lines[0]), int(lines[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400, detail="`lines` must be [start, end]")
+        if not anchor and not lines_tuple:
+            raise HTTPException(status_code=400,
+                                detail="provide `anchor` or `lines`")
+
+        p = _load_project(project_root)
+        try:
+            result = spec_mod.add_spec_ref(
+                p, node_id, path,
+                heading=anchor or None,
+                lines=lines_tuple,
+                why=body.get("why"),
+                actor="@web-ui-viewer",
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404,
+                                detail=f"node or spec not found: {node_id} / {path}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "repin": result}
+
+    # ---- Comment endpoints (HW-0033) -----------------------------------
+    #
+    # Comments live in `.hopewell/comments.jsonl` as an append-only event
+    # stream. Projection + reconciliation happen server-side on every
+    # read so the viewer sees drift/orphan state without an extra call.
+    #
+    #   GET  /api/comments/orphans                  — bucket of un-resolvable anchors
+    #   GET  /api/comments/{target}                 — threads for a node OR spec path
+    #   POST /api/comments                          — post a new comment
+    #   PATCH /api/comments/{id}                    — edit body
+    #   POST /api/comments/{id}/resolve             — resolve
+    #   POST /api/comments/{id}/reopen              — reopen
+    #   POST /api/comments/{id}/promote             — promote to comment-review node
+
+    def _thread_payload(t) -> Dict[str, Any]:
+        return t.to_dict()
+
+    @app.get("/api/comments/orphans")
+    def _comment_orphans() -> Dict[str, Any]:
+        from taskflow import comment as comment_mod
+        p = _load_project(project_root)
+        orph = comment_mod.orphans(p)
+        return {
+            "count": len(orph),
+            "threads": [_thread_payload(t) for t in orph],
+        }
+
+    @app.post("/api/comments")
+    async def _comment_post(request: Request) -> Dict[str, Any]:
+        """Post a new comment.
+
+        Body:
+            {
+              "target": "HW-0042" | "specs/x.md",
+              "body":   "...",
+              "anchor": {
+                 "type": "whole-file" | "heading-section" | "line-range",
+                 "heading": "...",            # for heading-section (text or slug)
+                 "lines":   [start, end],     # for line-range
+                 "explicit_anchor": "name"    # optional escape hatch
+              },
+              "actor":  "@chris"              # optional; falls back to header
+            }
+        """
+        from taskflow import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        target = body.get("target")
+        text = body.get("body")
+        if not target or not text:
+            raise HTTPException(status_code=400, detail="`target` and `body` required")
+        anchor = body.get("anchor") or {"type": "whole-file"}
+        if not isinstance(anchor, dict):
+            raise HTTPException(status_code=400, detail="`anchor` must be an object")
+        anchor_type = anchor.get("type") or "whole-file"
+        if anchor_type not in comment_mod.ANCHOR_TYPES:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown anchor type: {anchor_type}")
+        kwargs: Dict[str, Any] = {"anchor_type": anchor_type}
+        if anchor_type == comment_mod.ANCHOR_HEADING:
+            heading = anchor.get("heading") or anchor.get("heading_slug")
+            if not heading:
+                raise HTTPException(status_code=400,
+                                    detail="heading-section anchor needs `heading`")
+            kwargs["heading"] = heading
+        elif anchor_type == comment_mod.ANCHOR_LINE_RANGE:
+            lines = anchor.get("lines")
+            try:
+                kwargs["lines"] = (int(lines[0]), int(lines[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400,
+                                    detail="line-range anchor needs `lines: [start, end]`")
+        if anchor.get("explicit_anchor"):
+            kwargs["explicit_anchor"] = anchor.get("explicit_anchor")
+
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.post(p, target, text, actor=actor, **kwargs)
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.get("/api/comments/{target:path}")
+    def _comments_for_target(target: str,
+                             status: str = "open") -> Dict[str, Any]:
+        """List threads for a target.
+
+        `target` is a node id (HW-0042) or spec path (specs/x.md). FastAPI's
+        `{target:path}` accepts slashes so paths pass through cleanly.
+        """
+        from taskflow import comment as comment_mod
+        p = _load_project(project_root)
+        try:
+            threads = comment_mod.threads_for_target(p, target)
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        status = (status or "open").lower()
+        if status == "open":
+            threads = [t for t in threads if not t.resolved]
+        elif status == "resolved":
+            threads = [t for t in threads if t.resolved]
+        # else "all"
+        return {
+            "target": target,
+            "status": status,
+            "count": len(threads),
+            "threads": [_thread_payload(t) for t in threads],
+        }
+
+    @app.patch("/api/comments/{comment_id}")
+    async def _comment_edit(comment_id: str, request: Request) -> Dict[str, Any]:
+        from taskflow import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict) or not body.get("body"):
+            raise HTTPException(status_code=400, detail="`body` required")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.edit(p, comment_id, body["body"], actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/resolve")
+    async def _comment_resolve(comment_id: str, request: Request) -> Dict[str, Any]:
+        from taskflow import comment as comment_mod
+        reason: Optional[str] = None
+        actor: Optional[str] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = body.get("reason")
+                actor = body.get("actor")
+        except Exception:
+            pass
+        actor = actor or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.resolve(p, comment_id, reason=reason, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/reopen")
+    async def _comment_reopen(comment_id: str, request: Request) -> Dict[str, Any]:
+        from taskflow import comment as comment_mod
+        actor: Optional[str] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                actor = body.get("actor")
+        except Exception:
+            pass
+        actor = actor or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            thread = comment_mod.reopen(p, comment_id, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        return {"ok": True, "thread": _thread_payload(thread)}
+
+    @app.post("/api/comments/{comment_id}/promote")
+    async def _comment_promote(comment_id: str, request: Request) -> Dict[str, Any]:
+        from taskflow import comment as comment_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        title = body.get("title")
+        if not title:
+            raise HTTPException(status_code=400, detail="`title` required")
+        body_prefix = body.get("body_prefix") or ""
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            result = comment_mod.promote(p, comment_id, title,
+                                         body_prefix=body_prefix, actor=actor)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"comment not found: {comment_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, **result}
+
+    # ---- Reconciliation endpoints (HW-0034) ----------------------------
+    #
+    # Downstream-review nodes for spec drift. See `hopewell.reconciliation`
+    # for the data model + idempotency rules.
+    #
+    #   POST /api/reconcile/queue           — Trigger A: create reviews
+    #   GET  /api/reconcile/list            — list reviews (filtered)
+    #   POST /api/reconcile/{id}/resolve    — close a review with an outcome
+
+    @app.post("/api/reconcile/queue")
+    async def _reconcile_queue(request: Request) -> Dict[str, Any]:
+        """Trigger A: queue downstream-review nodes for consumers of a slice.
+
+        Body:
+            {
+              "spec_path": "specs/x.md",
+              "heading":   "## Foo",        # optional; either heading OR lines
+              "lines":     [start, end],    # optional
+              "dry_run":   false,           # optional
+              "actor":     "@chris"         # optional; falls back to header
+            }
+        """
+        from taskflow import reconciliation as recon_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        spec_path = body.get("spec_path")
+        if not spec_path:
+            raise HTTPException(status_code=400, detail="`spec_path` required")
+        heading = body.get("heading")
+        lines_raw = body.get("lines")
+        lines: Optional[Tuple[int, int]] = None
+        if lines_raw is not None:
+            try:
+                lines = (int(lines_raw[0]), int(lines_raw[1]))
+            except (TypeError, ValueError, IndexError):
+                raise HTTPException(status_code=400,
+                                    detail="`lines` must be [start, end]")
+        if heading and lines:
+            raise HTTPException(status_code=400,
+                                detail="provide `heading` OR `lines`, not both")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            results = recon_mod.queue_reviews(
+                p, spec_path,
+                heading=heading, lines=lines,
+                trigger=recon_mod.TRIGGER_SPEC_EDIT,
+                actor=actor,
+                dry_run=bool(body.get("dry_run", False)),
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "ok": True,
+            "spec_path": spec_path,
+            "count": len(results),
+            "created": sum(1 for r in results if r["action"] == "created"),
+            "skipped_existing": sum(1 for r in results if r["action"] == "skipped-existing"),
+            "skipped_clean": sum(1 for r in results if r["action"] == "skipped-clean"),
+            "dry_run_count": sum(1 for r in results if r["action"] == "dry-run"),
+            "results": results,
+        }
+
+    @app.get("/api/reconcile/list")
+    def _reconcile_list(consumer: Optional[str] = None,
+                        spec_path: Optional[str] = None,
+                        status: str = "open") -> Dict[str, Any]:
+        from taskflow import reconciliation as recon_mod
+        p = _load_project(project_root)
+        try:
+            rows = recon_mod.list_reviews(
+                p,
+                consumer=consumer,
+                spec_path=spec_path,
+                status=status,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "count": len(rows),
+            "filter": {"consumer": consumer, "spec_path": spec_path,
+                       "status": status},
+            "reviews": rows,
+        }
+
+    @app.post("/api/reconcile/{review_id}/resolve")
+    async def _reconcile_resolve(review_id: str, request: Request) -> Dict[str, Any]:
+        """Close a review with one of the four outcomes.
+
+        Body:
+            {
+              "outcome": "no-impact" | "update-in-scope"
+                       | "update-out-of-scope" | "spec-revert",
+              "notes":           "...",        # optional
+              "followup_title":  "...",        # required when outcome=update-out-of-scope
+              "actor":           "@chris"      # optional
+            }
+        """
+        from taskflow import reconciliation as recon_mod
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        outcome = body.get("outcome")
+        if not outcome:
+            raise HTTPException(status_code=400, detail="`outcome` required")
+        actor = body.get("actor") or request.headers.get("x-hopewell-actor")
+        p = _load_project(project_root)
+        try:
+            result = recon_mod.resolve_review(
+                p, review_id,
+                outcome=outcome,
+                notes=body.get("notes"),
+                followup_title=body.get("followup_title"),
+                actor=actor,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "result": result}
+
+    @app.get("/api/history")
+    def _history(limit: int = 50, cursor: int = 0) -> Dict[str, Any]:
+        """Return done nodes reverse-chron with close metadata + deps for tree view.
+
+        Close metadata is derived from `node.close` attestations (ts + actor +
+        commit + reason). Nodes that are `done` but have no close attestation
+        (e.g. legacy data) fall back to the node's `updated` timestamp and
+        empty actor/commit.
+
+        Response shape:
+            {
+              "items":  [ { "id", "title", "components", "priority", "closed_at",
+                            "closed_by", "commit", "reason", "blocked_by" }, ... ],
+              "nodes":  { id -> { "id", "title", "status", "components",
+                                  "blocked_by", "closed_at" } }   # for tree lookup
+              "total":  N,
+              "limit":  L,
+              "cursor": C,
+              "next":   C+L or None
+            }
+        """
+        from taskflow import attestation as att_mod
+        p = _load_project(project_root)
+
+        # 1. all nodes — build a summary index used by the tree view.
+        all_nodes = p.all_nodes()
+        summary: Dict[str, Dict[str, Any]] = {}
+        for n in all_nodes:
+            s = n.status.value if hasattr(n.status, "value") else n.status
+            summary[n.id] = {
+                "id": n.id,
+                "title": n.title,
+                "status": s,
+                "components": list(n.components),
+                "blocked_by": list(n.blocked_by),
+            }
+
+        # 2. scrape node.close attestations — latest wins per node.
+        close_meta: Dict[str, Dict[str, Any]] = {}
+        try:
+            for att in att_mod.iter_attestations(p.attestations_path):
+                if att.get("kind") != "node.close":
+                    continue
+                nid = att.get("node")
+                if not nid:
+                    continue
+                # keep the latest ts
+                prev = close_meta.get(nid)
+                ts = att.get("ts") or ""
+                if prev is None or ts > (prev.get("ts") or ""):
+                    close_meta[nid] = {
+                        "ts": ts,
+                        "actor": att.get("actor"),
+                        "commit": att.get("commit"),
+                        "reason": att.get("reason"),
+                    }
+        except Exception:
+            # attestations.jsonl absent is fine — fall through to updated-ts fallback.
+            pass
+
+        # 3. done nodes sorted by close ts desc.
+        done_nodes = [n for n in all_nodes
+                      if (n.status.value if hasattr(n.status, "value") else n.status) == "done"]
+
+        def _ts_for(n) -> str:
+            meta = close_meta.get(n.id)
+            if meta and meta.get("ts"):
+                return meta["ts"]
+            return n.updated or n.created or ""
+
+        done_nodes.sort(key=_ts_for, reverse=True)
+        total = len(done_nodes)
+
+        # Attach closed_at to summary entries so the tree view can style
+        # secondary appearances with their own timestamp if wanted.
+        for n in done_nodes:
+            if n.id in summary:
+                summary[n.id]["closed_at"] = _ts_for(n)
+
+        # 4. pagination.
+        try:
+            cur = max(int(cursor or 0), 0)
+        except (TypeError, ValueError):
+            cur = 0
+        try:
+            lim = max(int(limit or 50), 1)
+        except (TypeError, ValueError):
+            lim = 50
+        slice_ = done_nodes[cur:cur + lim]
+
+        items: List[Dict[str, Any]] = []
+        for n in slice_:
+            meta = close_meta.get(n.id, {})
+            items.append({
+                "id": n.id,
+                "title": n.title,
+                "priority": n.priority,
+                "components": list(n.components),
+                "blocked_by": list(n.blocked_by),
+                "closed_at": _ts_for(n),
+                "closed_by": meta.get("actor"),
+                "commit": meta.get("commit"),
+                "reason": meta.get("reason"),
+            })
+
+        nxt = cur + lim if cur + lim < total else None
+        return {
+            "items": items,
+            "nodes": summary,
+            "total": total,
+            "limit": lim,
+            "cursor": cur,
+            "next": nxt,
+        }
+
+    @app.get("/api/waves")
+    def _waves() -> Dict[str, Any]:
+        from taskflow import query as query_mod
+        p = _load_project(project_root)
+        return query_mod.waves(p)["stack"]
+
+    @app.get("/api/uat")
+    def _uat() -> List[Dict[str, Any]]:
+        from taskflow import uat as uat_mod
+        p = _load_project(project_root)
+        return uat_mod.list_uat(p, status="all")
+
+    @app.post("/api/node/{node_id}/uat-pass")
+    def _uat_pass(node_id: str) -> Dict[str, Any]:
+        from taskflow import uat as uat_mod
+        p = _load_project(project_root)
+        try:
+            block = uat_mod.mark(p, node_id, "passed",
+                                 verified_by="@web-ui", notes="marked via web UI")
+            return {"ok": True, "node": node_id, "uat": block}
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/node/{node_id}/uat-fail")
+    async def _uat_fail(node_id: str, request: Request) -> Dict[str, Any]:
+        from taskflow import uat as uat_mod
+        p = _load_project(project_root)
+        # Optional body: {"reason": "..."} — don't block on malformed JSON.
+        reason: Optional[str] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = body.get("reason")
+        except Exception:
+            pass
+        try:
+            block = uat_mod.mark(p, node_id, "failed",
+                                 verified_by="@web-ui",
+                                 failure_reason=reason or "failed via web UI")
+            return {"ok": True, "node": node_id, "uat": block}
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/node/{node_id}/uat-waive")
+    def _uat_waive(node_id: str) -> Dict[str, Any]:
+        from taskflow import uat as uat_mod
+        p = _load_project(project_root)
+        try:
+            block = uat_mod.mark(p, node_id, "waived",
+                                 verified_by="@web-ui",
+                                 notes="waived via web UI")
+            return {"ok": True, "node": node_id, "uat": block}
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # ---- Network (flow-map) endpoints — HW-0029 -------------------------
+    #
+    # These expose the flow network (executors + routes) plus live packet
+    # state to the Canvas tab. Layout overrides persist to
+    # `.hopewell/network/layout.json` — created/updated by the UI at
+    # runtime, NOT committed to the repo.
+
+    def _layout_path() -> Path:
+        return project_root / ".hopewell" / "network" / "layout.json"
+
+    def _load_layout() -> Dict[str, Any]:
+        lp = _layout_path()
+        if not lp.is_file():
+            return {"positions": {}, "updated": None}
+        try:
+            data = json.loads(lp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"positions": {}, "updated": None}
+            data.setdefault("positions", {})
+            return data
+        except (OSError, json.JSONDecodeError):
+            return {"positions": {}, "updated": None}
+
+    @app.get("/api/network")
+    def _network() -> Dict[str, Any]:
+        """Flow network JSON: executors + routes + saved layout overrides.
+
+        Shape:
+            {
+              "executors": [ {id, components, component_data, parent, label, ...}, ... ],
+              "routes":    [ {from, to, condition, required, label}, ... ],
+              "layout":    { "positions": { "<id>": {"x": n, "y": n}, ... } }
+            }
+        """
+        from taskflow import network as net_mod
+        try:
+            net = net_mod.load_network(project_root)
+            payload = net_mod.to_json(net)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to load network: {e}")
+        payload["layout"] = _load_layout()
+        return payload
+
+    @app.get("/api/packets")
+    def _packets() -> Dict[str, Any]:
+        """Live packet state per executor.
+
+        Returns, for every executor, the pending inbox (pushed but not
+        yet acked) and the active locations (work items currently
+        "inside" that executor). Plus a flat list of items currently
+        in-flight (push seen, no matching ack yet).
+
+        Shape:
+            {
+              "by_executor": {
+                "@engineer": {
+                  "inbox_depth": 2,
+                  "active_depth": 1,
+                  "inbox":    [ {node, pushed_at, from_executor, ...} ],
+                  "active":   [ {node_id, entered_at, last_artifact} ]
+                }, ...
+              },
+              "in_flight": [ {node, from_executor, to_executor, pushed_at}, ... ]
+            }
+        """
+        from taskflow import network as net_mod
+        from taskflow import flow as flow_mod
+        from taskflow import events as events_mod
+
+        p = _load_project(project_root)
+        net = net_mod.load_network(project_root)
+        by_executor: Dict[str, Dict[str, Any]] = {}
+        for eid in net.executors.keys():
+            inbox_items = flow_mod.inbox(p, eid)
+            by_executor[eid] = {
+                "inbox_depth": len(inbox_items),
+                "active_depth": 0,
+                "inbox": inbox_items,
+                "active": [],
+            }
+
+        # Active locations come from work-item node files.
+        for node in p.all_nodes():
+            for loc in getattr(node, "locations", []) or []:
+                if loc.left_at is not None:
+                    continue
+                slot = by_executor.get(loc.executor_id)
+                if slot is None:
+                    continue
+                slot["active"].append({
+                    "node_id": node.id,
+                    "title": node.title,
+                    "entered_at": loc.entered_at,
+                    "last_artifact": loc.last_artifact,
+                })
+                slot["active_depth"] += 1
+
+        # In-flight: any flow.push without a matching flow.ack (per-node FIFO).
+        # The logic mirrors flow.inbox() but we record the edge, not the queue.
+        in_flight: List[Dict[str, Any]] = []
+        try:
+            events = events_mod.read_all(p.events_path)
+        except Exception:
+            events = []
+        # Per (node, to_executor) outstanding pushes.
+        pending: Dict[str, List[Dict[str, Any]]] = {}
+        for ev in events:
+            kind = ev.get("kind")
+            data = ev.get("data") or {}
+            nid = ev.get("node")
+            if kind == "flow.push" and nid:
+                to_ex = data.get("to_executor")
+                if not to_ex:
+                    continue
+                pending.setdefault(f"{nid}|{to_ex}", []).append({
+                    "node": nid,
+                    "from_executor": data.get("from_executor"),
+                    "to_executor": to_ex,
+                    "pushed_at": ev.get("ts"),
+                })
+            elif kind == "flow.ack" and nid:
+                ex = data.get("executor")
+                if not ex:
+                    continue
+                q = pending.get(f"{nid}|{ex}")
+                if q:
+                    q.pop(0)
+        for q in pending.values():
+            in_flight.extend(q)
+        in_flight.sort(key=lambda e: e.get("pushed_at") or "")
+
+        return {"by_executor": by_executor, "in_flight": in_flight}
+
+    @app.get("/api/items/{node_id}/journey")
+    def _item_journey(node_id: str) -> Dict[str, Any]:
+        """Traversal events for one work item (chronological).
+
+        Shape:
+            {
+              "node_id": "HW-0029",
+              "events":  [ {ts, kind, executor, from, to, reason, artifact}, ... ],
+              "visited": [ "<executor_id>", ... ]   # ordered, de-duped
+            }
+        """
+        from taskflow import events as events_mod
+        p = _load_project(project_root)
+        if not p.has_node(node_id):
+            raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+        try:
+            events = events_mod.read_all(p.events_path)
+        except Exception:
+            events = []
+        journey: List[Dict[str, Any]] = []
+        visited: List[str] = []
+        seen: set = set()
+        flow_kinds = {"flow.push", "flow.ack", "flow.enter", "flow.leave"}
+        for ev in events:
+            if ev.get("kind") not in flow_kinds:
+                continue
+            if ev.get("node") != node_id:
+                continue
+            data = ev.get("data") or {}
+            entry: Dict[str, Any] = {
+                "ts": ev.get("ts"),
+                "kind": ev.get("kind"),
+            }
+            # Normalise executor fields so the client doesn't need to know
+            # which key each event-kind uses.
+            exec_id = data.get("executor") or data.get("to_executor")
+            from_id = data.get("from_executor")
+            if exec_id:
+                entry["executor"] = exec_id
+            if from_id:
+                entry["from_executor"] = from_id
+            if data.get("reason"):
+                entry["reason"] = data["reason"]
+            if data.get("artifact"):
+                entry["artifact"] = data["artifact"]
+            journey.append(entry)
+            # Add to visited path.
+            for candidate in (from_id, exec_id):
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    visited.append(candidate)
+        return {"node_id": node_id, "events": journey, "visited": visited}
+
+    @app.post("/api/network/layout")
+    async def _save_layout(request: Request) -> Dict[str, Any]:
+        """Persist manual node positions to `.hopewell/network/layout.json`.
+
+        Body: `{ "positions": { "<executor_id>": {"x": n, "y": n}, ... } }`
+        — we merge into the existing layout so the UI can send one
+        position at a time (drag-to-persist without a full resync).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be an object")
+        patch = body.get("positions") or {}
+        if not isinstance(patch, dict):
+            raise HTTPException(status_code=400, detail="`positions` must be an object")
+
+        current = _load_layout()
+        positions = dict(current.get("positions") or {})
+        for eid, pos in patch.items():
+            if pos is None:
+                positions.pop(eid, None)
+                continue
+            if not isinstance(pos, dict):
+                continue
+            try:
+                positions[eid] = {
+                    "x": float(pos.get("x")),
+                    "y": float(pos.get("y")),
+                }
+            except (TypeError, ValueError):
+                continue
+        out = {
+            "positions": positions,
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        lp = _layout_path()
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8")
+        return {"ok": True, "layout": out}
+
+    @app.post("/api/network/layout/reset")
+    def _reset_layout() -> Dict[str, Any]:
+        """Delete all manual overrides. Next canvas load uses dagre auto-layout."""
+        lp = _layout_path()
+        try:
+            if lp.is_file():
+                lp.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"failed to reset: {e}")
+        return {"ok": True, "layout": {"positions": {}, "updated": None}}
+
+    # ---- Markov / rework analytics (HW-0036) ----------------------------
+
+    @app.get("/api/markov")
+    def _markov(window: str = "30d", include_singletons: bool = True) -> Dict[str, Any]:
+        """Per-edge transition probabilities across all work items.
+
+        Query params:
+            window             — `all` | `30d` (default) | `7d` | `1d` |
+                                 `release-tag`.
+            include_singletons — count single-traversal items in the
+                                 base-rate total (default True).
+
+        Payload shape (abbreviated — see `hopewell.markov.compute`):
+            {
+              "window": "30d",
+              "total_items": 42, "total_transitions": 157,
+              "rework_events": 12, "rework_ratio": 0.076,
+              "edges": [ {from, to, count, probability, is_back,
+                          mean_dwell_seconds, time_weight_seconds,
+                          classification_source, declared_route}, ... ],
+              "sources": [ {executor, departures, mean_dwell_seconds}, ... ]
+            }
+        """
+        from taskflow import markov as markov_mod
+        p = _load_project(project_root)
+        try:
+            return markov_mod.compute(
+                p, window=window, include_singletons=bool(include_singletons),
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500,
+                                detail=f"markov aggregation failed: {e}")
+
+    # ---- SSE ------------------------------------------------------------
+    @app.get("/api/events")
+    async def _events(request: Request):
+        async def gen():
+            q = await bus.subscribe()
+            # initial hello so clients know the stream is alive
+            yield b": hopewell-sse hello\n\n"
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                        yield f"data: {payload}\n\n".encode("utf-8")
+                    except asyncio.TimeoutError:
+                        # keep-alive comment — prevents proxies idling us out
+                        yield b": keep-alive\n\n"
+            finally:
+                await bus.unsubscribe(q)
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    # ---- watchdog -------------------------------------------------------
+    @app.on_event("startup")
+    async def _startup() -> None:
+        loop_ref["loop"] = asyncio.get_event_loop()
+        _start_watcher(project_root, bus, loop_ref)
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Watchdog wiring
+# ---------------------------------------------------------------------------
+
+
+def _start_watcher(project_root: Path, bus: EventBus, loop_ref: Dict[str, Any]) -> None:
+    """Spin up a watchdog observer thread that tails events.jsonl.
+
+    Posting to the bus happens via `asyncio.run_coroutine_threadsafe` so
+    the cross-thread handoff into FastAPI's loop stays safe.
+    """
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    events_path = (project_root / ".hopewell" / "events.jsonl").resolve()
+    if not events_path.parent.is_dir():
+        # No .hopewell/ — nothing to tail; still serve the UI for debug.
+        return
+
+    def _dispatch(ev: Dict[str, Any]) -> None:
+        loop = loop_ref.get("loop")
+        if loop is None:
+            return
+        payload = json.dumps(ev, ensure_ascii=False)
+        asyncio.run_coroutine_threadsafe(bus.publish(payload), loop)
+
+    tailer = EventsTailer(events_path, on_event=_dispatch)
+
+    class _Handler(FileSystemEventHandler):
+        def on_modified(self, event) -> None:
+            if event.is_directory:
+                return
+            try:
+                if Path(event.src_path).resolve() == events_path:
+                    tailer.drain_new()
+            except OSError:
+                pass
+
+        # Treat created/moved as modified — some editors rename-on-save.
+        def on_created(self, event) -> None:
+            self.on_modified(event)
+
+        def on_moved(self, event) -> None:
+            try:
+                if Path(getattr(event, "dest_path", "")).resolve() == events_path:
+                    tailer.drain_new()
+            except OSError:
+                pass
+
+    observer = Observer()
+    observer.schedule(_Handler(), str(events_path.parent), recursive=False)
+    observer.daemon = True
+    observer.start()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def run(project_root: str = ".", port: int = 7420, open_browser: bool = False,
+        host: str = "127.0.0.1") -> None:
+    """Start the local web UI.
+
+    Parameters
+    ----------
+    project_root:
+        Path to a project containing `.hopewell/`.
+    port:
+        TCP port to bind. Default 7420 (HW = H-0x14, W = 0x20 — cute).
+    open_browser:
+        If True, open http://host:port/ in the system browser once the
+        server starts.
+    host:
+        Bind host. Defaults to 127.0.0.1; override at your own risk.
+    """
+    _require_web_extras()
+    import uvicorn
+
+    root = Path(project_root).resolve()
+    app = create_app(root)
+
+    if open_browser:
+        # Delay slightly so uvicorn has a chance to bind before we open.
+        def _open():
+            time.sleep(0.8)
+            try:
+                webbrowser.open(f"http://{host}:{port}/")
+            except Exception:
+                pass
+        threading.Thread(target=_open, daemon=True).start()
+
+    sys.stdout.write(f"hopewell web -> http://{host}:{port}/  (project: {root})\n")
+    sys.stdout.flush()
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+__all__ = ["run", "create_app"]
